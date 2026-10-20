@@ -9,20 +9,15 @@ PlasmoidItem {
     id: root
     property var clusters: []
     property string updated: ""
+    property int mutedUntil: 0
     property int current: 0
     property string nsFilter: ""
     property int section: 0
     property bool problemsOnly: false
     property string sevFilter: ""
-    property bool settingsOpen: false
-    property string cfgClusters: ""
-    property string cfgToken: ""
-    property string cfgChat: ""
-    property string cfgMsg: ""
 
-    readonly property string confDir: "\"${XDG_CONFIG_HOME:-$HOME/.config}/cluster-health\""
+    readonly property string bin: "\"$HOME/.local/bin/cluster-health\""
     readonly property string loadCmd: "cat \"${XDG_CACHE_HOME:-$HOME/.cache}/cluster-health/status.json\""
-    readonly property string cfgCmd: "d=" + confDir + "; jq -n --rawfile c \"$d/clusters\" --rawfile t \"$d/telegram.env\" '{c:$c,t:$t}'"
 
     function byNs(list) { return list.filter(x => !nsFilter || x.ns === nsFilter) }
     function bad(c) { return !c.up || c.watchdog === false }
@@ -41,6 +36,11 @@ PlasmoidItem {
         return { critical: Kirigami.Theme.negativeTextColor, warning: Kirigami.Theme.neutralTextColor }[s]
             || Kirigami.Theme.disabledTextColor
     }
+    function muteText() {
+        return mutedUntil === -1 ? "Muted until you unmute"
+            : mutedUntil > 0 ? "Muted until " + new Date(mutedUntil * 1000).toLocaleTimeString(Qt.locale(), Locale.ShortFormat)
+            : ""
+    }
     // Worst cluster drives the panel icon.
     readonly property var worst: clusters.length ? clusters.slice().sort((a, b) =>
         (bad(b) - bad(a)) || ((a.pods.pct ?? 100) - (b.pods.pct ?? 100)))[0] : null
@@ -55,45 +55,22 @@ PlasmoidItem {
                     const s = JSON.parse(data.stdout)
                     root.clusters = s.clusters
                     root.updated = s.updated
+                    root.mutedUntil = s.muted_until ?? 0
                 } catch (e) { root.clusters = [] }
-            } else if (source === root.cfgCmd) {
-                try {
-                    const s = JSON.parse(data.stdout)
-                    root.cfgClusters = s.c.trim()
-                    const get = k => ((s.t.match(new RegExp("^" + k + "=(.*)$", "m")) || [])[1] || "").trim()
-                    root.cfgToken = get("TG_TOKEN")
-                    root.cfgChat = get("TG_CHAT")
-                } catch (e) { root.cfgMsg = "Could not read settings" }
-            } else if (source.includes("#test")) {
-                root.cfgMsg = data.stdout.includes("\"ok\":true") ? "Test message sent" : "Telegram error: " + (data.stdout || data.stderr)
+            } else if (source.includes("#mute")) {
+                root.load()
             }
         }
     }
     function load() { exec.connectSource(loadCmd) }
     function refresh() { exec.connectSource("systemctl --user start cluster-health.service; true #refresh"); refreshTimer.start() }
-    function openSettings() { cfgMsg = ""; settingsOpen = true; exec.connectSource(cfgCmd) }
-    function saveSettings(test) {
-        // Values travel base64-encoded so nothing typed is ever interpreted by the shell.
-        const b64 = s => Qt.btoa(unescape(encodeURIComponent(s)))
-        const tg = "TG_TOKEN=" + cfgToken.trim() + "\nTG_CHAT=" + cfgChat.trim() + "\n"
-        let cmd = "d=" + confDir + "; mkdir -p \"$d\""
-            + "; echo " + b64(cfgClusters.trim() + "\n") + " | base64 -d > \"$d/clusters\""
-            + "; (umask 077; echo " + b64(tg) + " | base64 -d > \"$d/telegram.env\")"
-            + "; systemctl --user start cluster-health.service --no-block"
-        if (test)
-            cmd += "; . \"$d/telegram.env\"; curl -s -m 10 \"https://api.telegram.org/bot$TG_TOKEN/sendMessage\""
-                + " --data-urlencode \"chat_id=$TG_CHAT\" --data-urlencode \"text=✅ Cluster Health test message\" #test" + Date.now()
-        else
-            cmd += " #save" + Date.now()
-        cfgMsg = test ? "Sending…" : "Saved"
-        exec.connectSource(cmd)
-        refreshTimer.start()
-    }
+    function mute(arg) { exec.connectSource(bin + " --mute " + arg + " #mute" + Date.now()) }
     Timer { interval: 15000; running: true; repeat: true; triggeredOnStart: true; onTriggered: root.load() }
     Timer { id: refreshTimer; interval: 12000; onTriggered: root.load() }
 
+    Plasmoid.icon: "cluster-health"
     toolTipMainText: "Cluster Health"
-    toolTipSubText: clusters.map(c => `${c.name}: ${c.up ? pct(c) : "DOWN"}`).join("\n")
+    toolTipSubText: clusters.map(c => `${c.name}: ${c.up ? pct(c) : "DOWN"}`).join("\n") + (mutedUntil ? "\n🔕 " + muteText() : "")
 
     compactRepresentation: MouseArea {
         Layout.minimumWidth: row.implicitWidth
@@ -107,6 +84,12 @@ PlasmoidItem {
             }
             PlasmaComponents.Label {
                 text: !root.worst ? "?" : root.bad(root.worst) ? "DOWN" : root.pct(root.worst)
+            }
+            Kirigami.Icon {
+                visible: root.mutedUntil !== 0
+                source: "notifications-disabled"
+                Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                Layout.preferredHeight: Kirigami.Units.iconSizes.small
             }
         }
     }
@@ -130,7 +113,6 @@ PlasmoidItem {
         RowLayout {
             PlasmaComponents.TabBar {
                 Layout.fillWidth: true
-                visible: !root.settingsOpen
                 Repeater {
                     model: root.clusters
                     PlasmaComponents.TabButton {
@@ -139,72 +121,42 @@ PlasmoidItem {
                     }
                 }
             }
-            Kirigami.Heading { Layout.fillWidth: true; level: 3; text: "Settings"; visible: root.settingsOpen }
-            PlasmaComponents.ToolButton { icon.name: "view-refresh"; visible: !root.settingsOpen; onClicked: root.refresh() }
             PlasmaComponents.ToolButton {
-                icon.name: root.settingsOpen ? "go-previous" : "configure"
-                PlasmaComponents.ToolTip { text: root.settingsOpen ? "Back" : "Settings" }
-                onClicked: root.settingsOpen ? (root.settingsOpen = false) : root.openSettings()
+                icon.name: "view-refresh"
+                PlasmaComponents.ToolTip { text: "Check now" }
+                onClicked: root.refresh()
+            }
+            PlasmaComponents.ToolButton {
+                id: muteButton
+                icon.name: root.mutedUntil ? "notifications-disabled" : "notifications"
+                PlasmaComponents.ToolTip { text: root.mutedUntil ? root.muteText() : "Mute notifications" }
+                onClicked: muteMenu.popup(muteButton, 0, muteButton.height)
+                PlasmaComponents.Menu {
+                    id: muteMenu
+                    PlasmaComponents.MenuItem { text: "Unmute"; visible: root.mutedUntil !== 0; height: visible ? implicitHeight : 0; onTriggered: root.mute("off") }
+                    PlasmaComponents.MenuItem { text: "Mute for 1 hour"; onTriggered: root.mute(3600) }
+                    PlasmaComponents.MenuItem { text: "Mute for 4 hours"; onTriggered: root.mute(14400) }
+                    PlasmaComponents.MenuItem { text: "Mute for 8 hours"; onTriggered: root.mute(28800) }
+                    PlasmaComponents.MenuItem { text: "Mute for 24 hours"; onTriggered: root.mute(86400) }
+                    PlasmaComponents.MenuItem { text: "Mute until I unmute"; onTriggered: root.mute("forever") }
+                }
+            }
+            PlasmaComponents.ToolButton {
+                icon.name: "configure"
+                PlasmaComponents.ToolTip { text: "Settings" }
+                onClicked: Plasmoid.internalAction("configure").trigger()
             }
         }
 
-        // ---- Settings page ----
-        ColumnLayout {
-            visible: root.settingsOpen
-            Layout.fillWidth: true
-            Layout.fillHeight: true
-
-            PlasmaComponents.Label { text: "Kubeconfig files, one path per line (tab name = file name):" }
-            PlasmaComponents.ScrollView {
-                Layout.fillWidth: true
-                Layout.preferredHeight: Kirigami.Units.gridUnit * 6
-                PlasmaComponents.TextArea {
-                    text: root.cfgClusters
-                    placeholderText: "~/.kube/config"
-                    font.family: "monospace"
-                    onTextChanged: root.cfgClusters = text
-                }
-            }
-
-            Kirigami.Heading { level: 4; text: "Telegram"; Layout.topMargin: Kirigami.Units.largeSpacing }
-            PlasmaComponents.Label {
-                Layout.fillWidth: true; wrapMode: Text.Wrap; opacity: 0.7
-                text: "Create a bot with @BotFather, message it once, then get the chat id from api.telegram.org/bot<TOKEN>/getUpdates."
-            }
-            GridLayout {
-                columns: 2
-                Layout.fillWidth: true
-                PlasmaComponents.Label { text: "Bot token" }
-                PlasmaComponents.TextField {
-                    Layout.fillWidth: true
-                    echoMode: TextInput.Password
-                    text: root.cfgToken
-                    onTextChanged: root.cfgToken = text
-                }
-                PlasmaComponents.Label { text: "Chat id" }
-                PlasmaComponents.TextField {
-                    Layout.fillWidth: true
-                    text: root.cfgChat
-                    onTextChanged: root.cfgChat = text
-                }
-            }
-
-            RowLayout {
-                Layout.topMargin: Kirigami.Units.largeSpacing
-                PlasmaComponents.Button { text: "Save"; icon.name: "document-save"; onClicked: root.saveSettings(false) }
-                PlasmaComponents.Button {
-                    text: "Save and send test message"; icon.name: "mail-send"
-                    enabled: root.cfgToken !== "" && root.cfgChat !== ""
-                    onClicked: root.saveSettings(true)
-                }
-            }
-            PlasmaComponents.Label { text: root.cfgMsg; Layout.fillWidth: true; wrapMode: Text.Wrap }
-            Item { Layout.fillHeight: true }
-        }
-
-        // ---- Cluster view ----
         PlasmaComponents.Label {
-            visible: !!c && !root.settingsOpen
+            visible: root.mutedUntil !== 0
+            Layout.fillWidth: true
+            text: "🔕 " + root.muteText() + ". Anything still broken is sent when the mute ends."
+            opacity: 0.8
+        }
+
+        PlasmaComponents.Label {
+            visible: !!c
             Layout.fillWidth: true; wrapMode: Text.Wrap
             text: !c ? "" : (c.up ? "API ✅" : "API 🔴 unreachable")
                 + "   Watchdog " + (c.watchdog === null ? "n/a" : c.watchdog ? "✅" : "🔴 missing")
@@ -216,7 +168,6 @@ PlasmoidItem {
         }
 
         RowLayout {
-            visible: !root.settingsOpen
             PlasmaComponents.TabBar {
                 Layout.fillWidth: true
                 currentIndex: root.section
@@ -232,7 +183,7 @@ PlasmoidItem {
         }
 
         RowLayout {
-            visible: !root.settingsOpen && root.section !== 2
+            visible: root.section !== 2
             PlasmaComponents.CheckBox {
                 visible: root.section === 0
                 text: "Problems only"
@@ -250,7 +201,6 @@ PlasmoidItem {
 
         PlasmaComponents.ScrollView {
             id: scroll
-            visible: !root.settingsOpen
             Layout.fillWidth: true
             Layout.fillHeight: true
             PlasmaComponents.ScrollBar.horizontal.policy: PlasmaComponents.ScrollBar.AlwaysOff

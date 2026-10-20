@@ -1,15 +1,92 @@
 #!/usr/bin/env bash
-# Checks every cluster in ~/.config/cluster-health/clusters (one kubeconfig path per line),
-# writes ~/.cache/cluster-health/status.json and notifies (desktop + Telegram) on changes.
+# Checks every cluster in ~/.config/cluster-health/clusters, writes ~/.cache/cluster-health/status.json
+# and notifies (desktop, Telegram, Slack, Mattermost, Discord) on changes.
+#   cluster-health          run one check
+#   cluster-health --test   send a test message to every configured target
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/cluster-health"
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/cluster-health"
 mkdir -p "$CONF" "$CACHE"
 [ -f "$CONF/clusters" ] || echo "${KUBECONFIG:-$HOME/.kube/config}" > "$CONF/clusters"
-HEALTH_MIN=${HEALTH_MIN:-95}   # notify when pod health % drops below this
+[ -f "$CONF/telegram.env" ] && [ ! -f "$CONF/settings.env" ] && mv "$CONF/telegram.env" "$CONF/settings.env"
+
+# settings.env holds KEY=value lines; read as plain text, never sourced.
+cfg() { sed -n "s/^$1=//p" "$CONF/settings.env" 2>/dev/null | tail -1; }
+HEALTH_MIN=${HEALTH_MIN:-$(cfg HEALTH_MIN)}
+[[ $HEALTH_MIN =~ ^[0-9]+$ ]] || HEALTH_MIN=95   # notify when pod health % drops below this
+
+send() { # $1 urgency, $2 title, $3 body; prints one result line per target
+  local text="$2
+$3" r tok chat
+  if [ "$(cfg NOTIFY_DESKTOP)" != 0 ]; then
+    notify-send -a "Cluster Health" -u "$1" "$2" "$3" 2>/dev/null && echo "desktop: ok" || echo "desktop: failed"
+  fi
+  tok=$(cfg TG_TOKEN); chat=$(cfg TG_CHAT)
+  if [ -n "$tok" ] && [ -n "$chat" ]; then
+    r=$(curl -s -m 10 "https://api.telegram.org/bot$tok/sendMessage" --data-urlencode "chat_id=$chat" --data-urlencode "text=$text")
+    [[ $r == *'"ok":true'* ]] && echo "telegram: ok" || echo "telegram: failed $(jq -r '.description // empty' <<<"$r" 2>/dev/null)"
+  fi
+  hook() { # name url json
+    [ -n "$2" ] || return 0
+    r=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$3" "$2")
+    [[ $r == 2* ]] && echo "$1: ok" || echo "$1: failed (HTTP $r)"
+  }
+  hook slack "$(cfg SLACK_WEBHOOK)" "$(jq -n --arg t "$text" '{text: $t}')"
+  hook mattermost "$(cfg MATTERMOST_WEBHOOK)" "$(jq -n --arg t "$text" '{text: $t}')"
+  hook discord "$(cfg DISCORD_WEBHOOK)" "$(jq -n --arg t "$text" '{content: $t[:1990]}')"
+}
+KEYS="TG_TOKEN TG_CHAT SLACK_WEBHOOK MATTERMOST_WEBHOOK DISCORD_WEBHOOK HEALTH_MIN NOTIFY_DESKTOP MUTE_UNTIL"
+set_cfg() { # KEY=VALUE lines on stdin; unknown keys are ignored
+  local f="$CONF/settings.env" line k
+  umask 077   # settings hold tokens; the temp file below must be private too
+  touch "$f" && chmod 600 "$f"
+  while IFS= read -r line; do
+    k=${line%%=*}
+    [[ " $KEYS " == *" $k "* ]] || continue
+    { grep -v "^$k=" "$f"; printf '%s\n' "$line"; } > "$f.tmp" && mv "$f.tmp" "$f"
+  done
+}
+muted_until() { # epoch seconds, 0 = not muted, -1 = muted until unmuted
+  local m; m=$(cfg MUTE_UNTIL)
+  if [ "$m" = forever ]; then echo -1
+  elif [[ $m =~ ^[0-9]+$ ]] && [ "$m" -gt "$(date +%s)" ]; then echo "$m"
+  else echo 0; fi
+}
+
+# Commands used by the KDE and GNOME settings UIs.
+case "$1" in
+  --test)
+    send normal "✅ Cluster Health test" "Notifications are working."
+    exit 0 ;;
+  --get)
+    touch "$CONF/settings.env"
+    jq -n --rawfile c "$CONF/clusters" --rawfile s "$CONF/settings.env" --argjson m "$(muted_until)" \
+      '{clusters: $c, muted_until: $m,
+        settings: ([$s | split("\n")[] | capture("^(?<key>[A-Z_]+)=(?<value>.*)$")] | from_entries)}'
+    exit 0 ;;
+  --set) # --set KEY=VALUE ...   or   --set - (lines on stdin)
+    shift
+    if [ "$1" = - ]; then set_cfg; else printf '%s\n' "$@" | set_cfg; fi
+    exit 0 ;;
+  --clusters) # new clusters file on stdin
+    cat > "$CONF/clusters.tmp" && mv "$CONF/clusters.tmp" "$CONF/clusters"
+    exit 0 ;;
+  --mute) # --mute <seconds|forever|off>
+    case "$2" in
+      off|0) v=0 ;;
+      forever) v=forever ;;
+      ''|*[!0-9]*) echo "usage: cluster-health --mute <seconds|forever|off>" >&2; exit 1 ;;
+      *) v=$(( $(date +%s) + $2 )) ;;
+    esac
+    echo "MUTE_UNTIL=$v" | set_cfg
+    # Reflect the new mute state in the widget right away.
+    [ -f "$CACHE/status.json" ] && jq --argjson m "$(muted_until)" '.muted_until = $m' "$CACHE/status.json" > "$CACHE/status.json.tmp" \
+      && mv "$CACHE/status.json.tmp" "$CACHE/status.json"
+    exit 0 ;;
+esac
 
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 
-check() { # $1 = kubeconfig, writes $tmp/<name>.json
+check() { # $1 = kubeconfig, $2 = optional namespace/service:port of Alertmanager; writes $tmp/<name>.json
   local kc=$1 name d
   name=$(basename "${kc%.*}"); d="$tmp/$name"; mkdir -p "$d"
   k() { KUBECONFIG=$kc timeout 30 kubectl "$@" 2>/dev/null; }
@@ -21,14 +98,27 @@ check() { # $1 = kubeconfig, writes $tmp/<name>.json
     jq -n --arg n "$name" '{name:$n, up:false, watchdog:null, alerts:[], events:[], nodes:{total:0,notready:[]}, pods:{total:0,healthy:0,pct:null,namespaces:[],recent:[]}}' > "$tmp/$name.json"
     return
   fi
-  # watchdog: null = cluster has no alertmanager, false = alertmanager exists but Watchdog not firing/unreachable
-  local am=false
-  k get svc -n monitoring alertmanager -o name >/dev/null && am=true
-  get "$d/a" get --raw "/api/v1/namespaces/monitoring/services/alertmanager:9093/proxy/api/v2/alerts?active=true&silenced=false&inhibited=false"
+  # Alertmanager: override from the clusters file, else discovered by label or name (non-headless first).
+  local am=$2
+  if [ -z "$am" ]; then
+    get "$d/s" get svc -A -o json
+    am=$(jq -r '[.items[]? | select(.metadata.labels["app.kubernetes.io/name"] == "alertmanager"
+                or .metadata.labels["operated-alertmanager"] == "true" or .metadata.name == "alertmanager")]
+           | sort_by(.spec.clusterIP == "None") | first // empty
+           | "\(.metadata.namespace)/\(.metadata.name):\((.spec.ports | (map(select(.name | IN("web", "http-web", "http"))) | first) // .[0]).port)"' "$d/s")
+  fi
+  # watchdog: null = no Alertmanager found, false = Alertmanager found but Watchdog not firing or unreachable
+  if [ -n "$am" ]; then
+    local ns=${am%%/*} svc=${am#*/} port=9093
+    [[ $svc == *:* ]] && port=${svc##*:} && svc=${svc%%:*}
+    get "$d/a" get --raw "/api/v1/namespaces/$ns/services/$svc:$port/proxy/api/v2/alerts?active=true&silenced=false&inhibited=false"
+  else
+    echo null > "$d/a"
+  fi
   get "$d/p" get pods -A -o json
   get "$d/e" get events -A --field-selector type=Warning -o json
   get "$d/n" get nodes -o json
-  jq -n --arg n "$name" --argjson am "$am" --slurpfile A "$d/a" --slurpfile P "$d/p" --slurpfile E "$d/e" --slurpfile N "$d/n" '
+  jq -n --arg n "$name" --arg am "$am" --slurpfile A "$d/a" --slurpfile P "$d/p" --slurpfile E "$d/e" --slurpfile N "$d/n" '
     $A[0] as $a | $P[0] as $p | $E[0] as $e | $N[0] as $nodes |
     def age: (now - (sub("\\.[0-9]+"; "") | fromdateiso8601)) | floor
       | if . < 3600 then "\(./60|floor)m" elif . < 86400 then "\(./3600|floor)h" else "\(./86400|floor)d" end;
@@ -38,8 +128,8 @@ check() { # $1 = kubeconfig, writes $tmp/<name>.json
     ($p.items // []) as $items
     | ([$items[] | select(ok)] | length) as $healthy
     | {
-      name: $n, up: true,
-      watchdog: (if $am then ([$a[]? | select(.labels.alertname == "Watchdog")] | length > 0) else null end),
+      name: $n, up: true, alertmanager: $am,
+      watchdog: (if $am != "" then ([$a[]? | select(.labels.alertname == "Watchdog")] | length > 0) else null end),
       alerts: ([$a[]? | select(.labels.alertname | IN("Watchdog","InfoInhibitor") | not)
                | {name: .labels.alertname, ns: (.labels.namespace // ""), severity: (.labels.severity // ""),
                   msg: (.annotations.summary // .annotations.description // "")}]
@@ -77,14 +167,14 @@ check() { # $1 = kubeconfig, writes $tmp/<name>.json
     }' > "$tmp/$name.json"
 }
 
-while read -r kc; do
-  [ -n "$kc" ] && [ "${kc:0:1}" != "#" ] && check "${kc/#\~/$HOME}" &
+# clusters file: "<kubeconfig> [namespace/service:port of Alertmanager]" per line
+while read -r kc am; do
+  [ -n "$kc" ] && [ "${kc:0:1}" != "#" ] && check "${kc/#\~/$HOME}" "$am" &
 done < "$CONF/clusters"
 wait
 
-new=$(jq -s '{updated: (now | todate), clusters: .}' "$tmp"/*.json)
-old=$(cat "$CACHE/status.json" 2>/dev/null || echo "$new")
-echo "$new" > "$CACHE/status.json.tmp" && mv "$CACHE/status.json.tmp" "$CACHE/status.json"
+jq -s --argjson m "$(muted_until)" '{updated: (now | todate), muted_until: $m, clusters: .}' "$tmp"/*.json > "$tmp/status"
+cp "$tmp/status" "$CACHE/status.json.tmp" && mv "$CACHE/status.json.tmp" "$CACHE/status.json"
 
 # Problems worth a notification. Lines must be stable between runs (no changing numbers), since
 # notifications fire on lines that appear or disappear. Warnings stay in the UI only.
@@ -95,16 +185,15 @@ problems() { jq -r --argjson min "$HEALTH_MIN" '.clusters[] | .name as $c
     (.nodes.notready[]? | "\($c): node \(.) NotReady"),
     (if .up and .pods.pct != null and .pods.pct < $min then "\($c): pod health below \($min)%" else empty end),
     (.pods.recent[] | select(.reason | test("CrashLoopBackOff|OOMKilled")) | "\($c): \(.ns)/\(.name) \(.reason)")' | sort -u; }
-fired=$(comm -13 <(problems <<<"$old") <(problems <<<"$new"))
-resolved=$(comm -23 <(problems <<<"$old") <(problems <<<"$new"))
+problems < "$tmp/status" > "$tmp/problems"
 
-notify() { # $1 urgency, $2 title, $3 body
-  notify-send -a "Cluster Health" -u "$1" "$2" "$3" 2>/dev/null
-  [ -f "$CONF/telegram.env" ] && . "$CONF/telegram.env" && [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ] &&
-    curl -s -m 10 "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
-      --data-urlencode "chat_id=$TG_CHAT" --data-urlencode "text=$2
-$3" >/dev/null
-}
-[ -n "$fired" ] && notify critical "🔴 Cluster problem" "$fired"
-[ -n "$resolved" ] && notify normal "✅ Resolved" "$resolved"
+# $CACHE/notified = problems last announced. The first run only records them, so installing
+# does not send a burst. While muted it is left alone, so unmuting sends one catch-up diff.
+if [ ! -f "$CACHE/notified" ]; then cp "$tmp/problems" "$CACHE/notified"; exit 0; fi
+[ "$(muted_until)" != 0 ] && exit 0
+fired=$(comm -13 "$CACHE/notified" "$tmp/problems")
+resolved=$(comm -23 "$CACHE/notified" "$tmp/problems")
+[ -n "$fired" ] && send critical "🔴 Cluster problem" "$fired" >/dev/null
+[ -n "$resolved" ] && send normal "✅ Resolved" "$resolved" >/dev/null
+cp "$tmp/problems" "$CACHE/notified"
 exit 0

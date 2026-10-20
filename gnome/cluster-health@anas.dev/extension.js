@@ -15,6 +15,11 @@ const dot = c => bad(c) ? '🔴'
     : ((c.pods.pct ?? 100) < 95 || c.alerts.some(a => a.severity === 'critical') || (c.nodes?.notready.length ?? 0) > 0) ? '🟠'
     : '🟢';
 const SEVERITIES = ['', 'critical', 'warning', 'info'];
+const BIN = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'cluster-health']);
+const MUTES = [['Mute for 1 hour', '3600'], ['Mute for 4 hours', '14400'], ['Mute for 8 hours', '28800'],
+    ['Mute for 24 hours', '86400'], ['Mute until I unmute', 'forever']];
+const muteText = m => m === -1 ? 'Muted until you unmute'
+    : `Muted until ${GLib.DateTime.new_from_unix_local(m).format('%H:%M')}`;
 
 export default class ClusterHealth extends Extension {
     enable() {
@@ -23,8 +28,14 @@ export default class ClusterHealth extends Extension {
         this._problemsOnly = false;
         this._sevFilter = '';
         this._button = new PanelMenu.Button(0.0, 'Cluster Health', false);
+        const box = new St.BoxLayout({style_class: 'panel-status-menu-box'});
+        box.add_child(new St.Icon({
+            gicon: Gio.icon_new_for_string(`${this.path}/cluster-health.svg`),
+            style_class: 'system-status-icon',
+        }));
         this._label = new St.Label({text: '…', y_align: Clutter.ActorAlign.CENTER});
-        this._button.add_child(this._label);
+        box.add_child(this._label);
+        this._button.add_child(box);
         this._button.menu.connect('open-state-changed', (_m, open) => open && this._build());
         Main.panel.addToStatusArea(this.uuid, this._button);
         this._load();
@@ -46,7 +57,13 @@ export default class ClusterHealth extends Extension {
         }
         const cs = this._status?.clusters ?? [];
         const worst = cs.slice().sort((a, b) => (bad(b) - bad(a)) || ((a.pods.pct ?? 100) - (b.pods.pct ?? 100)))[0];
-        this._label.text = !worst ? '⚪ ?' : `${dot(worst)} ${bad(worst) ? 'DOWN' : pct(worst)}`;
+        this._label.text = (!worst ? '⚪ ?' : `${dot(worst)} ${bad(worst) ? 'DOWN' : pct(worst)}`) +
+            (this._status?.muted_until ? ' 🔕' : '');
+    }
+
+    _mute(arg) {
+        const proc = Gio.Subprocess.new([BIN, '--mute', arg], Gio.SubprocessFlags.NONE);
+        proc.wait_async(null, () => this._load());
     }
 
     _build() {
@@ -119,6 +136,21 @@ export default class ClusterHealth extends Extension {
             GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 12, () => { this._load(); return GLib.SOURCE_REMOVE; });
         });
         menu.addMenuItem(refresh);
+
+        const muted = this._status.muted_until ?? 0;
+        const muteMenu = new PopupMenu.PopupSubMenuMenuItem(muted ? `🔕 ${muteText(muted)}` : 'Mute notifications');
+        if (muted) {
+            const unmute = new PopupMenu.PopupMenuItem('Unmute');
+            unmute.connect('activate', () => this._mute('off'));
+            muteMenu.menu.addMenuItem(unmute);
+        }
+        for (const [label, arg] of MUTES) {
+            const item = new PopupMenu.PopupMenuItem(label);
+            item.connect('activate', () => this._mute(arg));
+            muteMenu.menu.addMenuItem(item);
+        }
+        menu.addMenuItem(muteMenu);
+
         const settings = new PopupMenu.PopupMenuItem('Settings…');
         settings.connect('activate', () => this.openPreferences());
         menu.addMenuItem(settings);

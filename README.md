@@ -1,21 +1,24 @@
-# cluster-health
+<p align="center"><img src="icons/cluster-health.svg" width="96" alt=""></p>
 
-Kubernetes cluster health in your desktop panel. Works on KDE Plasma 6 and GNOME Shell 45+, with desktop and Telegram alerts.
+# kube-health-widget
+
+Kubernetes cluster health in your desktop panel: a KDE Plasma 6 widget and a GNOME Shell 45+ extension, with desktop, Telegram, Slack, Mattermost and Discord alerts.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/anas1412/cluster-health/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/anas1412/kube-health-widget/main/install.sh | bash
 ```
 
 ## Features
 
-- **Down detection**: API health (`/readyz`) and the Alertmanager **Watchdog** alert. If Watchdog stops firing, your alerting pipeline is dead.
+- **Down detection**: API health (`/readyz`) and the Alertmanager **Watchdog** alert. If Watchdog stops firing, your alerting pipeline is dead. Alertmanager is found automatically.
 - **Pod health %**: healthy pods (Running and ready, or Completed) over total.
 - **Pods, Alerts, Warnings tabs**: newest pods with a colored state dot, firing Alertmanager alerts, recent `Warning` events.
 - **Filters**: namespace, problem pods only, alert severity.
 - **Nodes**: ready count, NotReady nodes listed by name.
 - **Multiple clusters**: one tab per kubeconfig.
-- **Notifications**: desktop and Telegram, sent once when a problem starts and once when it resolves.
-- **Settings UI**: clusters and Telegram from the widget, no file editing.
+- **Notifications**: desktop, Telegram, Slack, Mattermost, Discord. Sent once when a problem starts and once when it resolves.
+- **Mute**: for 1, 4, 8 or 24 hours, or until you unmute. You get a catch-up message when it ends.
+- **Settings UI**: everything is configurable from the widget, no file editing.
 - **Auto-update**: daily, from this repo.
 
 ## Requirements
@@ -24,12 +27,10 @@ curl -fsSL https://raw.githubusercontent.com/anas1412/cluster-health/main/instal
 - `git`, `kubectl`, `jq`, `curl`, `notify-send` (libnotify), systemd
 - kubeconfigs that already work with `kubectl`
 
-Watchdog needs an Alertmanager service named `alertmanager` on port 9093 in the `monitoring` namespace (the kube-prometheus default). Clusters without one show Watchdog as `n/a`; everything else still works.
-
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/anas1412/cluster-health/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/anas1412/kube-health-widget/main/install.sh | bash
 ```
 
 No root needed. The installer:
@@ -46,25 +47,55 @@ Then put it in your panel:
 | KDE | Right-click the panel > **Add or Manage Widgets** > search **Cluster Health** > drag it onto the panel |
 | GNOME | Log out and back in, then run `gnome-extensions enable cluster-health@anas.dev` |
 
-## Setup
+## Settings
 
-Open the widget and click the **gear icon** (KDE) or **Settings…** (GNOME).
+| Desktop | Open settings |
+| --- | --- |
+| KDE | Gear icon in the widget, or right-click the widget > **Configure Cluster Health** |
+| GNOME | **Settings…** in the menu, or the Extensions app |
 
-### Clusters
+Both write the same files, so settings carry over between desktops.
 
-One kubeconfig path per line. The file name becomes the tab name. Defaults to `$KUBECONFIG` or `~/.kube/config`.
+| Setting | Notes |
+| --- | --- |
+| Kubeconfig files | One per line. The file name becomes the tab name. Default: `$KUBECONFIG` or `~/.kube/config` |
+| Desktop notifications | On by default |
+| Pod health threshold | Notify below this %, default 95 |
+| Mute | See [Mute](#mute) |
+| Telegram | Bot token and chat id |
+| Slack, Mattermost, Discord | Incoming webhook URLs |
+
+**Save and send test message** saves, then sends a test to every configured target and shows the result for each.
+
+### Alertmanager
+
+Found automatically on each cluster: a service labeled `app.kubernetes.io/name=alertmanager`, the operator's `alertmanager-operated` service, or a service named `alertmanager`, in any namespace. Clusters without one show Watchdog as `n/a`; everything else still works.
+
+To set it by hand, add `namespace/service:port` after the kubeconfig path:
 
 ```
-~/.kube/prod.yml
+~/.kube/prod.yml     monitoring/alertmanager:9093
 ~/.kube/staging.yml
 ```
 
-### Telegram (optional)
+### Telegram
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) and copy its token.
 2. Send your bot any message.
 3. Open `https://api.telegram.org/bot<TOKEN>/getUpdates` and copy `message.chat.id`.
-4. Paste both into settings. On KDE, **Save and send test message** confirms it works.
+4. Paste both into settings.
+
+### Slack, Mattermost, Discord
+
+Create an incoming webhook in the channel you want, then paste its URL into settings.
+
+| Service | Where |
+| --- | --- |
+| Slack | [api.slack.com/apps](https://api.slack.com/apps) > your app > **Incoming Webhooks** > **Add New Webhook to Workspace** |
+| Mattermost | **Integrations** > **Incoming Webhooks** > **Add Incoming Webhook** |
+| Discord | Channel settings > **Integrations** > **Webhooks** > **New Webhook** > **Copy Webhook URL** |
+
+Messages are sent from your computer, so they stop while it is off or asleep. For team-wide 24/7 alerts, configure Alertmanager's own Slack or Mattermost receiver on the cluster instead.
 
 ## Notifications
 
@@ -75,23 +106,20 @@ Each problem is sent once when it starts and once when it resolves, never repeat
 | API unreachable (after one retry) | yes |
 | Watchdog missing | yes |
 | Node NotReady | yes |
-| Pod health below `HEALTH_MIN` (default 95%) | yes |
+| Pod health below the threshold | yes |
 | Pod in CrashLoopBackOff, or OOMKilled in the last hour | yes |
 | New `critical` alert | yes |
 | `warning` / `info` alerts, Warning events | widget only |
 
 Every request has a 30s timeout and one retry. If the pod list can't be fetched, health shows `?` and nothing is sent, so a slow network does not cause false alarms.
 
-Change the health threshold:
+The first check after installing only records the current state, so you are not flooded with problems that already existed.
 
-```bash
-systemctl --user edit cluster-health.service
-```
+### Mute
 
-```ini
-[Service]
-Environment=HEALTH_MIN=90
-```
+Use the bell button in the widget (KDE), **Mute notifications** in the menu (GNOME), or the Mute setting. Choose 1, 4, 8 or 24 hours, or until you unmute.
+
+While muted, the widget keeps updating and shows 🔕, but nothing is sent. When the mute ends you get one catch-up message: problems that started during the mute and are still active, and problems that were resolved.
 
 ## Widget
 
@@ -102,6 +130,7 @@ Environment=HEALTH_MIN=90
 | 🟢 `99%` | all good (lowest pod health across clusters) |
 | 🟠 `93%` | pod health below 95%, a critical alert, or a NotReady node |
 | 🔴 `DOWN` | API unreachable or Watchdog missing |
+| 🔕 | notifications muted |
 
 ### Pod states
 
@@ -135,7 +164,19 @@ systemctl --user disable --now cluster-health-update.timer     # turn off auto-u
 ~/.local/share/cluster-health/install.sh --uninstall
 ```
 
-Removes the checker, timers, widget and extension. Settings in `~/.config/cluster-health` are kept.
+Removes the checker, timers, widget, extension and icon. Settings in `~/.config/cluster-health` are kept.
+
+## Command line
+
+```bash
+cluster-health                        # run a check now
+cluster-health --test                 # send a test message to every configured target
+cluster-health --mute 3600            # mute for 1 hour (seconds), or: --mute forever, --mute off
+cluster-health --set HEALTH_MIN=90    # change a setting
+cluster-health --get                  # print all settings as JSON
+```
+
+Setting keys: `NOTIFY_DESKTOP`, `HEALTH_MIN`, `TG_TOKEN`, `TG_CHAT`, `SLACK_WEBHOOK`, `MATTERMOST_WEBHOOK`, `DISCORD_WEBHOOK`, `MUTE_UNTIL`.
 
 ## How it works
 
@@ -143,26 +184,26 @@ Removes the checker, timers, widget and extension. Settings in `~/.config/cluste
 cluster-health.timer (every 60s)
   └─ cluster-health ──kubectl──> each cluster
        ├─ ~/.cache/cluster-health/status.json ──> KDE widget / GNOME extension (read only)
-       └─ on change: notify-send + Telegram
+       └─ on change, unless muted: desktop, Telegram, Slack, Mattermost, Discord
 
 cluster-health-update.timer (daily)
   └─ install.sh --update: git pull, reinstall if changed
 ```
 
-The checker is plain bash and works on any desktop. The panel UIs only read `status.json`, so they never call the cluster themselves.
+The checker is plain bash and works on any desktop. The panel UIs read `status.json` and change settings only through the `cluster-health` command, so they never call the cluster themselves.
 
 | Path | Content |
 | --- | --- |
 | `~/.config/cluster-health/clusters` | kubeconfig list |
-| `~/.config/cluster-health/telegram.env` | `TG_TOKEN`, `TG_CHAT` (mode 600) |
+| `~/.config/cluster-health/settings.env` | settings and secrets (mode 600, read as text, never executed) |
 | `~/.cache/cluster-health/status.json` | latest state of all clusters |
+| `~/.cache/cluster-health/notified` | problems already notified |
 | `~/.local/share/cluster-health` | installed copy of this repo |
 
 ## Troubleshooting
 
 ```bash
-cluster-health                                                       # run a check now
-jq '.clusters[] | {name, up, watchdog, pct: .pods.pct}' ~/.cache/cluster-health/status.json
+jq '.clusters[] | {name, up, watchdog, alertmanager, pct: .pods.pct}' ~/.cache/cluster-health/status.json
 systemctl --user list-timers 'cluster-health*'
 journalctl --user -u cluster-health.service -u cluster-health-update.service
 ```
@@ -171,8 +212,8 @@ journalctl --user -u cluster-health.service -u cluster-health-update.service
 | --- | --- |
 | Widget shows `?` | No status yet. Run `cluster-health`, then check that `kubectl` works with each kubeconfig. |
 | Widget not in the Add Widgets list (KDE) | Run `systemctl --user restart plasma-plasmashell` |
-| No Telegram messages | Use **Save and send test message**; check the bot token and that you messaged the bot first. |
-| Watchdog `n/a` | The cluster has no `monitoring/alertmanager` service. |
+| A target gets no messages | Use **Save and send test message**; it shows the error for each target. |
+| Watchdog `n/a` | No Alertmanager found. Set it by hand in the clusters list. |
 
 ## License
 

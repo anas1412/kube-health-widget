@@ -9,9 +9,23 @@ import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/ex
 const BIN = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'kube-health']);
 const MUTES = [['Not muted', 'off'], ['1 hour', '3600'], ['4 hours', '14400'], ['8 hours', '28800'],
     ['24 hours', '86400'], ['Until I unmute', 'forever']];
+// Notification rules: NOTIFY_<key>=0 turns one off. limit names the threshold setting shown next to it.
+const RULES = [
+    {key: 'API', text: 'A cluster API is unreachable'},
+    {key: 'WATCHDOG', text: 'Watchdog is missing (alerting is down)'},
+    {key: 'CRITICAL', text: 'A critical alert fires'},
+    {key: 'NODE_NOTREADY', text: 'A node becomes NotReady'},
+    {key: 'NODE_PRESSURE', text: 'A node has memory, disk or PID pressure'},
+    {key: 'NODE_CPU', text: "A node's CPU reaches (%)", limit: 'NODE_CPU_MAX', def: 90},
+    {key: 'NODE_MEM', text: "A node's RAM reaches (%)", limit: 'NODE_MEM_MAX', def: 90},
+    {key: 'POD_HEALTH', text: 'Pod health drops below (%)', limit: 'HEALTH_MIN', def: 95},
+    {key: 'CRASHLOOP', text: 'A pod is in CrashLoopBackOff or OOMKilled'},
+    {key: 'PIPELINES', text: 'A pipeline fails (and when it is fixed)'},
+];
+const MAX_MATCHES = 10;
 
 function run(args, input = null) {
-    const flags = Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE |
+    const flags = Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE |
         (input === null ? 0 : Gio.SubprocessFlags.STDIN_PIPE);
     const proc = Gio.Subprocess.new([BIN, ...args], flags);
     return new Promise((resolve, reject) => {
@@ -26,98 +40,168 @@ function run(args, input = null) {
 }
 
 const desc = text => new Gtk.Label({label: text, wrap: true, xalign: 0, css_classes: ['dim-label', 'caption'], margin_top: 6});
+const repoName = id => id.replace(/^[a-z]+:/, '').replace(/@.*$/, '');
 
 export default class KubeHealthPrefs extends ExtensionPreferences {
-    async fillPreferencesWindow(window) {
-        let s = {clusters: '', settings: {}, muted_until: 0};
-        try {
-            s = JSON.parse(await run(['--get']));
-        } catch (e) {
-            window.add_toast(new Adw.Toast({title: `Could not load settings: is ${BIN} installed?`}));
-        }
-        const v = s.settings;
-
+    fillPreferencesWindow(window) {
         const page = new Adw.PreferencesPage({title: 'General', icon_name: 'preferences-system-symbolic'});
         window.add(page);
+        let mutedUntil = 0;
 
-        // Clusters
+        // ---- Clusters ----
         const clustersGroup = new Adw.PreferencesGroup({title: 'Clusters'});
-        const buffer = new Gtk.TextBuffer({text: s.clusters.trim()});
+        const buffer = new Gtk.TextBuffer();
         const view = new Gtk.TextView({buffer, monospace: true, top_margin: 8, bottom_margin: 8, left_margin: 8, right_margin: 8});
-        clustersGroup.add(new Gtk.Frame({child: view, height_request: 110}));
+        clustersGroup.add(new Gtk.Frame({child: view, height_request: 100}));
         clustersGroup.add(desc('One kubeconfig per line; the file name becomes the tab name. Alertmanager is detected ' +
             'automatically. To set it by hand, add it after the path: ~/.kube/prod.yml monitoring/alertmanager:9093'));
         page.add(clustersGroup);
 
-        // Notifications
-        const notifyGroup = new Adw.PreferencesGroup({title: 'Notifications'});
-        const desktop = new Adw.SwitchRow({title: 'Desktop notifications', active: v.NOTIFY_DESKTOP !== '0'});
-        const healthMin = Adw.SpinRow.new_with_range(0, 100, 1);
-        healthMin.set({title: 'Notify when pod health is below (%)', value: parseInt(v.HEALTH_MIN || '95')});
-        const muteNote = s.muted_until === -1 ? 'Muted until you unmute'
-            : s.muted_until > 0 ? `Muted until ${GLib.DateTime.new_from_unix_local(s.muted_until).format('%H:%M')}` : '';
-        const mute = new Adw.ComboRow({title: 'Mute', subtitle: muteNote, model: Gtk.StringList.new(MUTES.map(m => m[0]))});
-        notifyGroup.add(desktop);
-        notifyGroup.add(healthMin);
-        notifyGroup.add(mute);
-        page.add(notifyGroup);
-
-        // Telegram
-        const tgGroup = new Adw.PreferencesGroup({
-            title: 'Telegram',
-            description: 'Create a bot with @BotFather, message it once, then read message.chat.id from api.telegram.org/bot<TOKEN>/getUpdates.',
+        // ---- CI pipelines: no search shows tracked repos, searching shows the first matches ----
+        const repoGroup = new Adw.PreferencesGroup({
+            title: 'CI pipelines',
+            description: 'Lists what your gh (GitHub) and glab (GitLab) logins can see. Each repo is tracked on its default branch.',
         });
-        const tgToken = new Adw.PasswordEntryRow({title: 'Bot token', text: v.TG_TOKEN || ''});
-        const tgChat = new Adw.EntryRow({title: 'Chat id', text: v.TG_CHAT || ''});
-        tgGroup.add(tgToken);
-        tgGroup.add(tgChat);
-        page.add(tgGroup);
+        const search = new Gtk.SearchEntry({placeholder_text: 'Loading repositories from gh and glab…', margin_bottom: 6});
+        const list = new Gtk.ListBox({selection_mode: Gtk.SelectionMode.NONE, css_classes: ['boxed-list']});
+        const listNote = new Gtk.Label({xalign: 0, css_classes: ['dim-label'], margin_top: 6});
+        repoGroup.add(search);
+        repoGroup.add(list);
+        repoGroup.add(listNote);
+        page.add(repoGroup);
 
-        // Webhooks
-        const hookGroup = new Adw.PreferencesGroup({
-            title: 'Webhooks',
+        const selected = new Set();
+        const rows = new Map();   // id -> row
+        let loaded = false;
+        const addRow = (id, name, subtitle) => {
+            if (rows.has(id))
+                return;
+            const row = new Adw.SwitchRow({title: name, subtitle, active: selected.has(id)});
+            row.connect('notify::active', () => (row.active ? selected.add(id) : selected.delete(id)));
+            rows.set(id, row);
+            list.append(row);
+        };
+        const filter = () => {
+            const q = search.text.trim().toLowerCase();
+            let shown = 0, matches = 0;
+            for (const [id, row] of rows) {
+                const match = q ? repoName(id).toLowerCase().includes(q) : selected.has(id);
+                if (match)
+                    matches++;
+                row.visible = match && (!q || shown < MAX_MATCHES);
+                if (row.visible)
+                    shown++;
+            }
+            list.visible = shown > 0;
+            listNote.label = q
+                ? (matches === 0 ? (loaded ? 'No matches' : 'Still loading…')
+                    : matches > MAX_MATCHES ? `${matches - MAX_MATCHES} more, refine your search` : '')
+                : (selected.size === 0 ? 'None yet. Search above to add repositories.' : '');
+            listNote.visible = listNote.label !== '';
+        };
+        search.connect('search-changed', filter);
+
+        // ---- Notify me when ----
+        const rulesGroup = new Adw.PreferencesGroup({
+            title: 'Notify me when',
+            description: 'Each problem is sent once when it starts and once when it is resolved. ' +
+                'Node CPU and RAM only count as resolved 5 points below the limit, so a node at the edge does not flap.',
+        });
+        const ruleRows = {}, limitSpins = {};
+        for (const r of RULES) {
+            const row = new Adw.SwitchRow({title: r.text, active: true});
+            if (r.limit) {
+                const spin = Gtk.SpinButton.new_with_range(1, 100, 1);
+                spin.set({value: r.def, valign: Gtk.Align.CENTER});
+                row.bind_property('active', spin, 'sensitive', 2 /* SYNC_CREATE */);
+                row.add_suffix(spin);
+                limitSpins[r.limit] = spin;
+            }
+            ruleRows[r.key] = row;
+            rulesGroup.add(row);
+        }
+        page.add(rulesGroup);
+
+        // ---- Delivery ----
+        const deliveryGroup = new Adw.PreferencesGroup({
+            title: 'Delivery',
             description: 'Messages are sent from this computer, so they stop while it is off or asleep.',
         });
-        const slack = new Adw.PasswordEntryRow({title: 'Slack webhook URL', text: v.SLACK_WEBHOOK || ''});
-        const mattermost = new Adw.PasswordEntryRow({title: 'Mattermost webhook URL', text: v.MATTERMOST_WEBHOOK || ''});
-        const discord = new Adw.PasswordEntryRow({title: 'Discord webhook URL', text: v.DISCORD_WEBHOOK || ''});
-        hookGroup.add(slack);
-        hookGroup.add(mattermost);
-        hookGroup.add(discord);
-        page.add(hookGroup);
+        const desktop = new Adw.SwitchRow({title: 'Desktop notifications', active: true});
+        const mute = new Adw.ComboRow({title: 'Mute', model: Gtk.StringList.new(MUTES.map(m => m[0]))});
+        const tgToken = new Adw.PasswordEntryRow({title: 'Telegram bot token (from @BotFather)'});
+        const tgChat = new Adw.EntryRow({title: 'Telegram chat id'});
+        const slack = new Adw.PasswordEntryRow({title: 'Slack webhook URL'});
+        const mattermost = new Adw.PasswordEntryRow({title: 'Mattermost webhook URL'});
+        const discord = new Adw.PasswordEntryRow({title: 'Discord webhook URL'});
+        for (const w of [desktop, mute, tgToken, tgChat, slack, mattermost, discord])
+            deliveryGroup.add(w);
+        page.add(deliveryGroup);
 
         const save = async () => {
-            await run(['--set', '-'], [
-                `NOTIFY_DESKTOP=${desktop.active ? 1 : 0}`, `HEALTH_MIN=${healthMin.value}`,
-                `TG_TOKEN=${tgToken.text.trim()}`, `TG_CHAT=${tgChat.text.trim()}`,
-                `SLACK_WEBHOOK=${slack.text.trim()}`, `MATTERMOST_WEBHOOK=${mattermost.text.trim()}`,
-                `DISCORD_WEBHOOK=${discord.text.trim()}`,
-            ].join('\n') + '\n');
+            const lines = RULES.map(r => `NOTIFY_${r.key}=${ruleRows[r.key].active ? 1 : 0}`)
+                .concat(Object.entries(limitSpins).map(([k, s]) => `${k}=${s.get_value_as_int()}`))
+                .concat([`NOTIFY_DESKTOP=${desktop.active ? 1 : 0}`,
+                    `TG_TOKEN=${tgToken.text.trim()}`, `TG_CHAT=${tgChat.text.trim()}`,
+                    `SLACK_WEBHOOK=${slack.text.trim()}`, `MATTERMOST_WEBHOOK=${mattermost.text.trim()}`,
+                    `DISCORD_WEBHOOK=${discord.text.trim()}`]);
+            await run(['--set', '-'], `${lines.join('\n')}\n`);
             await run(['--clusters'], `${buffer.text.trim()}\n`);
-            if (mute.selected > 0 || s.muted_until !== 0)
+            await run(['--repos'], `${[...selected].join('\n')}\n`);
+            if (mute.selected > 0 || mutedUntil !== 0)
                 await run(['--mute', MUTES[mute.selected][1]]);
             GLib.spawn_command_line_async('systemctl --user start kube-health.service --no-block');
         };
 
-        // Actions
+        // ---- Actions ----
         const actions = new Adw.PreferencesGroup();
         const result = new Gtk.Label({wrap: true, xalign: 0, selectable: true, css_classes: ['monospace']});
         const box = new Gtk.Box({spacing: 12, halign: Gtk.Align.END, margin_top: 12});
         const testBtn = new Gtk.Button({label: 'Save and send test message'});
         const saveBtn = new Gtk.Button({label: 'Save', css_classes: ['suggested-action']});
-        testBtn.connect('clicked', async () => {
+        testBtn.connect('clicked', () => {
             result.label = 'Sending…';
-            await save();
-            result.label = (await run(['--test'])).trim() || 'No notification targets configured';
+            save().then(() => run(['--test'])).then(out => {
+                result.label = out.trim() || 'No notification targets configured';
+            });
         });
-        saveBtn.connect('clicked', async () => {
-            await save();
-            window.add_toast(new Adw.Toast({title: 'Saved'}));
-        });
+        saveBtn.connect('clicked', () => save().then(() => window.add_toast(new Adw.Toast({title: 'Saved'}))));
         box.append(testBtn);
         box.append(saveBtn);
         actions.add(box);
         actions.add(result);
         page.add(actions);
+
+        // Load current settings, then the (slower) repository list.
+        run(['--get']).then(out => {
+            const s = JSON.parse(out), v = s.settings;
+            buffer.text = s.clusters.trim();
+            for (const r of RULES)
+                ruleRows[r.key].active = v[`NOTIFY_${r.key}`] !== '0';
+            for (const r of RULES.filter(x => x.limit))
+                limitSpins[r.limit].value = parseInt(v[r.limit] || `${r.def}`);
+            desktop.active = v.NOTIFY_DESKTOP !== '0';
+            tgToken.text = v.TG_TOKEN || '';
+            tgChat.text = v.TG_CHAT || '';
+            slack.text = v.SLACK_WEBHOOK || '';
+            mattermost.text = v.MATTERMOST_WEBHOOK || '';
+            discord.text = v.DISCORD_WEBHOOK || '';
+            mutedUntil = s.muted_until;
+            mute.subtitle = mutedUntil === -1 ? 'Muted until you unmute'
+                : mutedUntil > 0 ? `Muted until ${GLib.DateTime.new_from_unix_local(mutedUntil).format('%H:%M')}` : '';
+            for (const id of s.repos) {
+                selected.add(id);
+                addRow(id, repoName(id), `${id.split(':')[0]}, ${id.split('@').pop()}`);
+            }
+            filter();
+            return run(['--list-repos']);
+        }).then(out => {
+            const repos = JSON.parse(out);
+            for (const r of repos)
+                addRow(r.id, r.name, `${r.source}, ${r.id.split('@').pop()}`);
+            loaded = true;
+            search.placeholder_text = `Search ${repos.length} repositories`;
+            filter();
+        }).catch(() => window.add_toast(new Adw.Toast({title: `Could not load settings: is ${BIN} installed?`})));
     }
 }

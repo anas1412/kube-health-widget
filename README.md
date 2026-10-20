@@ -12,11 +12,11 @@ curl -fsSL https://raw.githubusercontent.com/anas1412/kube-health-widget/main/in
 
 - **Down detection**: API health (`/readyz`) and the Alertmanager **Watchdog** alert. If Watchdog stops firing, your alerting pipeline is dead. Alertmanager is found automatically.
 - **Pod health %**: healthy pods (Running and ready, or Completed) over total.
-- **Pods, Alerts, Warnings tabs**: newest pods with a colored state dot, firing Alertmanager alerts, recent `Warning` events.
-- **Filters**: namespace, problem pods only, alert severity.
-- **Nodes**: ready count, NotReady nodes listed by name.
-- **Multiple clusters**: one tab per kubeconfig.
-- **Notifications**: desktop, Telegram, Slack, Mattermost, Discord. Sent once when a problem starts and once when it resolves.
+- **Nodes, Pods, Alerts, Warnings tabs**: CPU and RAM per node, newest pods with a colored state dot, firing Alertmanager alerts, recent `Warning` events.
+- **Filters**: namespace, problems only, alert severity.
+- **Multiple clusters**: pick one from a dropdown.
+- **CI pipelines**: latest GitHub Actions / GitLab CI status of the repos you pick, with commit and a link to the run.
+- **Notifications**: desktop, Telegram, Slack, Mattermost, Discord. Sent once when a problem starts and once when it resolves. Every rule can be turned off and has its own threshold where it makes sense.
 - **Mute**: for 1, 4, 8 or 24 hours, or until you unmute. You get a catch-up message when it ends.
 - **Settings UI**: everything is configurable from the widget, no file editing.
 - **Auto-update**: daily, from this repo.
@@ -26,6 +26,8 @@ curl -fsSL https://raw.githubusercontent.com/anas1412/kube-health-widget/main/in
 - KDE Plasma 6 or GNOME Shell 45 to 49
 - `git`, `kubectl`, `jq`, `curl`, `notify-send` (libnotify), systemd
 - kubeconfigs that already work with `kubectl`
+- for node CPU and RAM: [metrics-server](https://github.com/kubernetes-sigs/metrics-server) on the cluster (nodes show "no metrics" without it)
+- optional, for CI pipelines: [`gh`](https://cli.github.com) and/or [`glab`](https://gitlab.com/gitlab-org/cli), logged in
 
 ## Install
 
@@ -58,9 +60,10 @@ Both write the same files, so settings carry over between desktops.
 
 | Setting | Notes |
 | --- | --- |
-| Kubeconfig files | One per line. The file name becomes the tab name. Default: `$KUBECONFIG` or `~/.kube/config` |
+| Kubeconfig files | One per line. The file name is the cluster's name. Default: `$KUBECONFIG` or `~/.kube/config` |
+| CI pipelines | Repos to track. See [CI pipelines](#ci-pipelines) |
+| Notify me when | One switch per rule, with thresholds. See [Notifications](#notifications) |
 | Desktop notifications | On by default |
-| Pod health threshold | Notify below this %, default 95 |
 | Mute | See [Mute](#mute) |
 | Telegram | Bot token and chat id |
 | Slack, Mattermost, Discord | Incoming webhook URLs |
@@ -77,6 +80,25 @@ To set it by hand, add `namespace/service:port` after the kubeconfig path:
 ~/.kube/prod.yml     monitoring/alertmanager:9093
 ~/.kube/staging.yml
 ```
+
+### CI pipelines
+
+In settings, search the repos your `gh` and `glab` logins can see and tick the ones to track. With an empty search the list shows only tracked repos. Each repo is tracked on its default branch.
+
+Switch the widget to **Pipelines** at the top: one row per repo, click a row to open the run in your browser. The switch shows a badge with failed and running counts, e.g. `Pipelines 🔴 1 🔵 2`.
+
+| Dot | Status |
+| --- | --- |
+| 🟢 | passed |
+| 🔵 | running or queued |
+| 🔴 | failed |
+| ⚪ | canceled, no pipelines yet, or could not fetch |
+
+On GitHub, all workflows of the latest commit are combined: one failed workflow makes the commit red.
+
+Notifications use the last **finished** pipeline. A failed branch that is re-running shows as 🔵 running with "(last run failed)", but you only get ✅ once a run actually passes, so a retry that fails again doesn't send a false "fixed" and a second "failed".
+
+Self-hosted GitLab works too: add `gitlab:gitlab.example.com/group/project@main` to `~/.config/kube-health/repos` (glab must be logged in to that host).
 
 ### Telegram
 
@@ -99,17 +121,24 @@ Messages are sent from your computer, so they stop while it is off or asleep. Fo
 
 ## Notifications
 
-Each problem is sent once when it starts and once when it resolves, never repeated.
+Each problem is sent once when it starts and once when it resolves, never repeated. All rules are on by default; turn any of them off under **Notify me when** in settings.
 
-| Problem | Notified |
-| --- | --- |
-| API unreachable (after one retry) | yes |
-| Watchdog missing | yes |
-| Node NotReady | yes |
-| Pod health below the threshold | yes |
-| Pod in CrashLoopBackOff, or OOMKilled in the last hour | yes |
-| New `critical` alert | yes |
-| `warning` / `info` alerts, Warning events | widget only |
+| Rule | Threshold | Setting |
+| --- | --- | --- |
+| A cluster API is unreachable (after one retry) | | `NOTIFY_API` |
+| Watchdog is missing | | `NOTIFY_WATCHDOG` |
+| A critical alert fires | | `NOTIFY_CRITICAL` |
+| A node becomes NotReady | | `NOTIFY_NODE_NOTREADY` |
+| A node has MemoryPressure, DiskPressure or PIDPressure | | `NOTIFY_NODE_PRESSURE` |
+| A node's CPU reaches the limit | 90% (`NODE_CPU_MAX`) | `NOTIFY_NODE_CPU` |
+| A node's RAM reaches the limit | 90% (`NODE_MEM_MAX`) | `NOTIFY_NODE_MEM` |
+| Pod health drops below the limit | 95% (`HEALTH_MIN`) | `NOTIFY_POD_HEALTH` |
+| A pod is in CrashLoopBackOff, or OOMKilled in the last hour | | `NOTIFY_CRASHLOOP` |
+| A pipeline fails (last finished run) | | `NOTIFY_PIPELINES` |
+
+`warning` / `info` alerts and Warning events show in the widget only.
+
+Node CPU and RAM only count as resolved once they drop 5 points below the limit, so a node hovering at the edge doesn't send a new alert every minute.
 
 Every request has a 30s timeout and one retry. If the pod list can't be fetched, health shows `?` and nothing is sent, so a slow network does not cause false alarms.
 
@@ -123,14 +152,30 @@ While muted, the widget keeps updating and shows 🔕, but nothing is sent. When
 
 ## Widget
 
+```
+[ Clusters ]  [ Pipelines 🔴 1 🔵 2 ]                 ⟳  🔔  ⚙
+[ prod ▾ ]   API ✅  Watchdog ✅  Pods 99%  Nodes 15/15
+[ Nodes ]  [ Pods ]  [ Alerts ]  [ Warnings ]     [ All namespaces ▾ ]
+```
+
 ### Panel icon
 
 | Icon | Meaning |
 | --- | --- |
 | 🟢 `99%` | all good (lowest pod health across clusters) |
-| 🟠 `93%` | pod health below 95%, a critical alert, or a NotReady node |
+| 🟠 `93%` | pod health below the limit, a critical alert, or a node with a problem |
 | 🔴 `DOWN` | API unreachable or Watchdog missing |
 | 🔕 | notifications muted |
+
+### Nodes
+
+Each node shows its pool, pods running / pod capacity, and CPU and RAM bars with used / total. Problem nodes are listed first, then the busiest.
+
+| Dot | State |
+| --- | --- |
+| 🟢 | Ready, below the CPU and RAM limits |
+| 🟠 | Pressure condition, or CPU or RAM at the limit |
+| 🔴 | NotReady |
 
 ### Pod states
 
@@ -145,8 +190,8 @@ While muted, the widget keeps updating and shows 🔕, but nothing is sent. When
 
 | Filter | Applies to |
 | --- | --- |
-| Namespace | all tabs |
-| Problems only (🔴 and 🟠) | Pods |
+| Namespace | Pods, Alerts, Warnings |
+| Problems only (🔴 and 🟠) | Nodes, Pods |
 | Severity: critical / warning / info | Alerts |
 
 ## Updates
@@ -174,9 +219,10 @@ kube-health --test                 # send a test message to every configured tar
 kube-health --mute 3600            # mute for 1 hour (seconds), or: --mute forever, --mute off
 kube-health --set HEALTH_MIN=90    # change a setting
 kube-health --get                  # print all settings as JSON
+kube-health --list-repos           # repos your gh and glab logins can see
 ```
 
-Setting keys: `NOTIFY_DESKTOP`, `HEALTH_MIN`, `TG_TOKEN`, `TG_CHAT`, `SLACK_WEBHOOK`, `MATTERMOST_WEBHOOK`, `DISCORD_WEBHOOK`, `MUTE_UNTIL`.
+Setting keys: the `NOTIFY_*` rules and thresholds from [Notifications](#notifications), plus `NOTIFY_DESKTOP`, `TG_TOKEN`, `TG_CHAT`, `SLACK_WEBHOOK`, `MATTERMOST_WEBHOOK`, `DISCORD_WEBHOOK`, `MUTE_UNTIL`.
 
 ## How it works
 
@@ -195,6 +241,7 @@ The checker is plain bash and works on any desktop. The panel UIs read `status.j
 | Path | Content |
 | --- | --- |
 | `~/.config/kube-health/clusters` | kubeconfig list |
+| `~/.config/kube-health/repos` | tracked repos, one `github:owner/repo@branch` or `gitlab:path@branch` per line |
 | `~/.config/kube-health/settings.env` | settings and secrets (mode 600, read as text, never executed) |
 | `~/.cache/kube-health/status.json` | latest state of all clusters |
 | `~/.cache/kube-health/notified` | problems already notified |

@@ -9,6 +9,9 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 const STATUS = GLib.build_filenamev([GLib.get_user_cache_dir(), 'kube-health', 'status.json']);
 const POD_DOT = {ok: '🟢', pending: '🟠', bad: '🔴', done: '⚪'};
+const PIPE_DOT = {passed: '🟢', failed: '🔴', running: '🔵', pending: '🔵'};
+const PIPE_TEXT = {passed: 'passed', failed: 'failed', running: 'running', pending: 'pending', canceled: 'canceled',
+    none: 'no pipelines', error: 'could not fetch'};
 const bad = c => !c.up || c.watchdog === false;
 const pct = c => c.pods.pct == null ? '?' : `${c.pods.pct}%`;
 const dot = c => bad(c) ? '🔴'
@@ -122,12 +125,44 @@ export default class KubeHealth extends Extension {
                 return s;
             };
             const icon = s => s === 'critical' ? '🔴' : s === 'warning' ? '🟠' : '⚪';
+            const th = this._status.thresholds ?? {node_cpu: 90, node_mem: 90};
+            const nodeDot = n => !n.ready ? '🔴'
+                : (n.pressure.length || (n.cpu_pct ?? 0) >= th.node_cpu || (n.mem_pct ?? 0) >= th.node_mem) ? '🟠' : '🟢';
+            const usage = (p, used, total, unit) => p == null ? 'no metrics' : `${used} / ${total} ${unit} ${p}%`;
+            const nodes = (c.nodes?.list ?? []).slice().sort((a, b) =>
+                (nodeDot(a) === '🟢') - (nodeDot(b) === '🟢') ||
+                Math.max(b.cpu_pct ?? 0, b.mem_pct ?? 0) - Math.max(a.cpu_pct ?? 0, a.mem_pct ?? 0));
+            sub(`Nodes (${nodes.length})`, nodes.map(n =>
+                `${nodeDot(n)} ${n.name}${n.pool ? `  ·  ${n.pool}` : ''}  ·  ${n.pods}/${n.pods_max} pods` +
+                `${n.ready ? '' : '  ·  NotReady'}${n.pressure.length ? `  ·  ${n.pressure.join(', ')}` : ''}\n` +
+                `      CPU ${usage(n.cpu_pct, (n.cpu_used ?? 0).toFixed(1), n.cpu_total.toFixed(1), 'cores')}   ` +
+                `RAM ${usage(n.mem_pct, ((n.mem_used ?? 0) / 1073741824).toFixed(1), (n.mem_total / 1073741824).toFixed(1), 'GiB')}`));
             this._podMenus.push([c, sub('Recent pods', [])]);
             const alerts = c.alerts.filter(a => !this._sevFilter || a.severity === this._sevFilter);
             sub(`Alerts (${alerts.length})`, alerts.map(a => `${icon(a.severity)} ${a.name} ${a.ns} · ${a.msg}`));
             sub(`Warnings (${c.events.length})`, c.events.map(e => `🟠 ${e.age} ${e.reason} ${e.ns}/${e.obj} · ${e.msg}`));
         }
         this._fillPods();
+
+        const pipes = this._status.pipelines ?? [];
+        if (pipes.length) {
+            const failed = pipes.filter(p => p.status === 'failed').length;
+            const running = pipes.filter(p => p.status === 'running' || p.status === 'pending').length;
+            const pipeMenu = new PopupMenu.PopupSubMenuMenuItem(
+                `Pipelines${failed ? `  🔴 ${failed}` : ''}${running ? `  🔵 ${running}` : ''}`);
+            for (const p of pipes) {
+                const note = p.status !== 'failed' && p.last_finished === 'failed' ? ' (last run failed)' : '';
+                const item = new PopupMenu.PopupMenuItem(
+                    `${PIPE_DOT[p.status] ?? '⚪'} ${p.name}  ${p.branch}  ·  ${PIPE_TEXT[p.status] ?? p.status}${note}` +
+                    `${p.age ? `  ·  ${p.age}` : ''}${p.sha ? `\n      ${p.sha}  ${p.title ?? ''}` : ''}`,
+                    {reactive: !!p.url});
+                if (p.url)
+                    item.connect('activate', () => Gio.AppInfo.launch_default_for_uri(p.url, null));
+                pipeMenu.menu.addMenuItem(item);
+            }
+            menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('CI'));
+            menu.addMenuItem(pipeMenu);
+        }
 
         menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem(`Updated ${this._status.updated}`));
         const refresh = new PopupMenu.PopupMenuItem('Refresh now');

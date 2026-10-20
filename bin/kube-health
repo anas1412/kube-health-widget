@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
-# Checks every cluster in ~/.config/kube-health/clusters, writes ~/.cache/kube-health/status.json
-# and notifies (desktop, Telegram, Slack, Mattermost, Discord) on changes.
+# Checks every cluster in ~/.config/kube-health/clusters and the CI pipeline of every repo in
+# ~/.config/kube-health/repos, writes ~/.cache/kube-health/status.json and notifies
+# (desktop, Telegram, Slack, Mattermost, Discord) on changes.
 #   kube-health          run one check
 #   kube-health --test   send a test message to every configured target
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/kube-health"
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/kube-health"
 mkdir -p "$CONF" "$CACHE"
 [ -f "$CONF/clusters" ] || echo "${KUBECONFIG:-$HOME/.kube/config}" > "$CONF/clusters"
+[ -f "$CONF/repos" ] || touch "$CONF/repos"
 [ -f "$CONF/telegram.env" ] && [ ! -f "$CONF/settings.env" ] && mv "$CONF/telegram.env" "$CONF/settings.env"
 
 # settings.env holds KEY=value lines; read as plain text, never sourced.
 cfg() { sed -n "s/^$1=//p" "$CONF/settings.env" 2>/dev/null | tail -1; }
 HEALTH_MIN=${HEALTH_MIN:-$(cfg HEALTH_MIN)}
 [[ $HEALTH_MIN =~ ^[0-9]+$ ]] || HEALTH_MIN=95   # notify when pod health % drops below this
+NODE_CPU_MAX=$(cfg NODE_CPU_MAX); [[ $NODE_CPU_MAX =~ ^[0-9]+$ ]] || NODE_CPU_MAX=90   # notify when a node's CPU % reaches this
+NODE_MEM_MAX=$(cfg NODE_MEM_MAX); [[ $NODE_MEM_MAX =~ ^[0-9]+$ ]] || NODE_MEM_MAX=90   # notify when a node's RAM % reaches this
 
 send() { # $1 urgency, $2 title, $3 body; prints one result line per target
   local text="$2
@@ -34,7 +38,8 @@ $3" r tok chat
   hook mattermost "$(cfg MATTERMOST_WEBHOOK)" "$(jq -n --arg t "$text" '{text: $t}')"
   hook discord "$(cfg DISCORD_WEBHOOK)" "$(jq -n --arg t "$text" '{content: $t[:1990]}')"
 }
-KEYS="TG_TOKEN TG_CHAT SLACK_WEBHOOK MATTERMOST_WEBHOOK DISCORD_WEBHOOK HEALTH_MIN NOTIFY_DESKTOP MUTE_UNTIL"
+RULES="API WATCHDOG CRITICAL NODE_NOTREADY NODE_PRESSURE NODE_CPU NODE_MEM POD_HEALTH CRASHLOOP PIPELINES"
+KEYS="TG_TOKEN TG_CHAT SLACK_WEBHOOK MATTERMOST_WEBHOOK DISCORD_WEBHOOK HEALTH_MIN NODE_CPU_MAX NODE_MEM_MAX NOTIFY_DESKTOP MUTE_UNTIL $(printf 'NOTIFY_%s ' $RULES)"
 set_cfg() { # KEY=VALUE lines on stdin; unknown keys are ignored
   local f="$CONF/settings.env" line k
   umask 077   # settings hold tokens; the temp file below must be private too
@@ -59,9 +64,28 @@ case "$1" in
     exit 0 ;;
   --get)
     touch "$CONF/settings.env"
-    jq -n --rawfile c "$CONF/clusters" --rawfile s "$CONF/settings.env" --argjson m "$(muted_until)" \
-      '{clusters: $c, muted_until: $m,
+    jq -n --rawfile c "$CONF/clusters" --rawfile r "$CONF/repos" --rawfile s "$CONF/settings.env" --argjson m "$(muted_until)" \
+      '{clusters: $c, repos: [$r | split("\n")[] | select(length > 0)], muted_until: $m,
         settings: ([$s | split("\n")[] | capture("^(?<key>[A-Z_]+)=(?<value>.*)$")] | from_entries)}'
+    exit 0 ;;
+  --repos) # new repos file on stdin: github:owner/repo@branch or gitlab:[host/]group/project@branch
+    cat > "$CONF/repos.tmp" && mv "$CONF/repos.tmp" "$CONF/repos"
+    exit 0 ;;
+  --list-repos) # every repo the gh and glab logins can see, most recently pushed first
+    {
+      if command -v gh >/dev/null; then
+        for owner in "" $(timeout 20 gh api user/orgs -q '.[].login' 2>/dev/null); do
+          timeout 30 gh repo list $owner --limit 300 --no-archived --json nameWithOwner,defaultBranchRef,pushedAt 2>/dev/null \
+            | jq -c '.[] | select(.defaultBranchRef.name) | {id: "github:\(.nameWithOwner)@\(.defaultBranchRef.name)",
+                     name: .nameWithOwner, source: "github", pushed: .pushedAt}'
+        done
+      fi
+      if command -v glab >/dev/null; then
+        timeout 30 glab api --paginate "projects?membership=true&archived=false&simple=true&per_page=100" 2>/dev/null \
+          | jq -c '.[] | select(.default_branch) | {id: "gitlab:\(.path_with_namespace)@\(.default_branch)",
+                   name: .path_with_namespace, source: "gitlab", pushed: .last_activity_at}'
+      fi
+    } | jq -s 'unique_by(.id) | sort_by(.pushed) | reverse'
     exit 0 ;;
   --set) # --set KEY=VALUE ...   or   --set - (lines on stdin)
     shift
@@ -85,8 +109,65 @@ case "$1" in
 esac
 
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp/c" "$tmp/p"
 
-check() { # $1 = kubeconfig, $2 = optional namespace/service:port of Alertmanager; writes $tmp/<name>.json
+AGE='def age: (now - (sub("\\.[0-9]+"; "") | fromdateiso8601)) | floor
+  | if . < 3600 then "\(./60|floor)m" elif . < 86400 then "\(./3600|floor)h" else "\(./86400|floor)d" end;'
+
+pipeline() { # $1 = repo spec (github:owner/repo@branch, gitlab:[host/]path@branch), $2 = output file
+  local spec=$1 out=$2 kind=${1%%:*} rest=${1#*:} repo branch host path enc
+  repo=${rest%@*}; branch=${rest##*@}; [ "$branch" = "$rest" ] && branch=""
+  # status: passed, failed, running, pending, canceled, none (no pipelines), error (could not fetch).
+  # last_finished drives notifications, so a running pipeline never counts as fixed.
+  case $kind in
+    github)
+      timeout 20 gh run list -R "$repo" ${branch:+-b "$branch"} -L 30 \
+        --json status,conclusion,headSha,displayTitle,url,createdAt > "$out.raw" 2>/dev/null || echo null > "$out.raw"
+      jq --arg id "$spec" --arg name "$repo" --arg b "$branch" "$AGE"'
+        def norm: if .status != "completed" then (if .status | IN("queued","waiting","pending","requested") then "pending" else "running" end)
+          elif .conclusion | IN("success","skipped","neutral") then "passed"
+          elif .conclusion | IN("failure","timed_out","startup_failure") then "failed" else "canceled" end;
+        # All workflows of one commit combined: any failure wins, then running, then pending.
+        def combine: map(norm) as $s
+          | if any($s[]; . == "failed") then "failed" elif any($s[]; . == "running") then "running"
+            elif any($s[]; . == "pending") then "pending" elif all($s[]; . == "canceled") then "canceled" else "passed" end;
+        {id: $id, name: $name, branch: $b} + (
+          if . == null then {status: "error"}
+          elif length == 0 then {status: "none"}
+          else .[0].headSha as $sha | [.[] | select(.headSha == $sha)] as $cur
+            | ([.[] | select(.status == "completed")][0].headSha) as $fsha
+            | {status: ($cur | combine), sha: $sha[:7], title: $cur[0].displayTitle, url: $cur[0].url,
+               age: ($cur[0].createdAt | age),
+               last_finished: (if $fsha then [.[] | select(.headSha == $fsha and .status == "completed")] | combine else null end)}
+          end)' "$out.raw" > "$out" ;;
+    gitlab)
+      path=$repo
+      # A first segment with a dot is a self-hosted GitLab host: gitlab:gitlab.example.com/group/project
+      [[ ${repo%%/*} == *.* ]] && host=${repo%%/*} && path=${repo#*/}
+      enc=$(jq -rn --arg p "$path" '$p | @uri')
+      g() { timeout 20 glab api ${host:+--hostname "$host"} "$@" 2>/dev/null; }
+      local q="ref=$(jq -rn --arg b "$branch" '$b | @uri')&per_page=1"
+      g "projects/$enc/pipelines?$q" > "$out.cur" || echo null > "$out.cur"
+      g "projects/$enc/pipelines?$q&scope=finished" > "$out.fin" || echo null > "$out.fin"
+      local sha; sha=$(jq -r '.[0].sha? // empty' "$out.cur")
+      { [ -n "$sha" ] && g "projects/$enc/repository/commits/$sha"; } > "$out.commit" || echo '{}' > "$out.commit"
+      jq -n --arg id "$spec" --arg name "$path" --arg b "$branch" \
+        --slurpfile C "$out.cur" --slurpfile F "$out.fin" --slurpfile M "$out.commit" "$AGE"'
+        def norm: if . == "success" then "passed" elif . == "failed" then "failed" elif . == "running" then "running"
+          elif . | IN("canceled","skipped") then "canceled" else "pending" end;
+        $C[0] as $c | $F[0] as $f | ($M[0] // {}) as $m
+        | {id: $id, name: $name, branch: $b} + (
+          if ($c | type) != "array" then {status: "error"}
+          elif ($c | length) == 0 then {status: "none"}
+          else {status: ($c[0].status | norm), sha: $c[0].sha[:7], title: ($m.title // ""), url: $c[0].web_url,
+                age: ($c[0].created_at | age), last_finished: ($f[0].status? | if . then norm else null end)}
+          end)' > "$out" ;;
+    *)
+      jq -n --arg id "$spec" '{id: $id, name: $id, branch: "", status: "error"}' > "$out" ;;
+  esac
+}
+
+check() { # $1 = kubeconfig, $2 = optional namespace/service:port of Alertmanager; writes $tmp/c/<name>.json
   local kc=$1 name d
   name=$(basename "${kc%.*}"); d="$tmp/$name"; mkdir -p "$d"
   k() { KUBECONFIG=$kc timeout 30 kubectl "$@" 2>/dev/null; }
@@ -95,7 +176,7 @@ check() { # $1 = kubeconfig, $2 = optional namespace/service:port of Alertmanage
     { k "$@" > "$out" && [ -s "$out" ]; } || { sleep 2; k "$@" > "$out" && [ -s "$out" ]; } || echo null > "$out"; }
   # One retry so a single slow request is not reported as an outage.
   if [ "$(k get --raw /readyz)" != "ok" ] && { sleep 3; [ "$(k get --raw /readyz)" != "ok" ]; }; then
-    jq -n --arg n "$name" '{name:$n, up:false, watchdog:null, alerts:[], events:[], nodes:{total:0,notready:[]}, pods:{total:0,healthy:0,pct:null,namespaces:[],recent:[]}}' > "$tmp/$name.json"
+    jq -n --arg n "$name" '{name:$n, up:false, watchdog:null, alerts:[], events:[], nodes:{total:0,notready:[],list:[]}, pods:{total:0,healthy:0,pct:null,namespaces:[],recent:[]}}' > "$tmp/c/$name.json"
     return
   fi
   # Alertmanager: override from the clusters file, else discovered by label or name (non-headless first).
@@ -118,8 +199,18 @@ check() { # $1 = kubeconfig, $2 = optional namespace/service:port of Alertmanage
   get "$d/p" get pods -A -o json
   get "$d/e" get events -A --field-selector type=Warning -o json
   get "$d/n" get nodes -o json
-  jq -n --arg n "$name" --arg am "$am" --slurpfile A "$d/a" --slurpfile P "$d/p" --slurpfile E "$d/e" --slurpfile N "$d/n" '
+  get "$d/m" get --raw /apis/metrics.k8s.io/v1beta1/nodes   # metrics-server; null if not installed
+  jq -n --arg n "$name" --arg am "$am" --slurpfile A "$d/a" --slurpfile P "$d/p" --slurpfile E "$d/e" --slurpfile N "$d/n" \
+    --slurpfile M "$d/m" '
     $A[0] as $a | $P[0] as $p | $E[0] as $e | $N[0] as $nodes |
+    ([$M[0].items[]? | {key: .metadata.name, value: .usage}] | from_entries) as $usage |
+    def cores: if endswith("n") then .[:-1] | tonumber / 1e9 elif endswith("u") then .[:-1] | tonumber / 1e6
+      elif endswith("m") then .[:-1] | tonumber / 1000 else tonumber end;
+    def bytes: capture("^(?<n>[0-9.]+)(?<u>[A-Za-z]*)$") | (.n | tonumber)
+      * ({"": 1, "k": 1e3, "M": 1e6, "G": 1e9, "Ki": 1024, "Mi": 1048576, "Gi": 1073741824, "Ti": 1099511627776}[.u] // 1);
+    def pct(used; total): if used == null or total == 0 then null else used * 100 / total | floor end;
+    ([($p.items // [])[] | select(.status.phase | IN("Succeeded", "Failed") | not) | .spec.nodeName] | group_by(.)
+      | map({key: .[0], value: length}) | from_entries) as $podsOn |
     def age: (now - (sub("\\.[0-9]+"; "") | fromdateiso8601)) | floor
       | if . < 3600 then "\(./60|floor)m" elif . < 86400 then "\(./3600|floor)h" else "\(./86400|floor)d" end;
     def ok: .status.phase == "Succeeded"
@@ -140,7 +231,19 @@ check() { # $1 = kubeconfig, $2 = optional namespace/service:port of Alertmanage
                       reason: .reason, msg: (.message | split("\n")[0] | .[:200]), age: (.t | age)})),
       nodes: {
         total: ($nodes.items // [] | length),
-        notready: [($nodes.items // [])[] | select([.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length == 0) | .metadata.name]
+        notready: [($nodes.items // [])[] | select([.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length == 0) | .metadata.name],
+        list: [($nodes.items // [])[] | .metadata.name as $nn | $usage[$nn] as $u
+          | (.status.allocatable.cpu | cores) as $cpuT | (.status.allocatable.memory | bytes) as $memT
+          | ($u.cpu | if . then cores else null end) as $cpuU | ($u.memory | if . then bytes else null end) as $memU
+          | {name: $nn,
+             pool: (.metadata.labels | .nodepool // .agentpool // .["eks.amazonaws.com/nodegroup"]
+                    // .["cloud.google.com/gke-nodepool"] // .["karpenter.sh/nodepool"] // ""),
+             ready: ([.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length > 0),
+             pressure: [.status.conditions[]? | select((.type | test("Pressure$")) and .status == "True") | .type],
+             cpu_used: ($cpuU | if . then . * 100 | floor / 100 else null end), cpu_total: $cpuT, cpu_pct: pct($cpuU; $cpuT),
+             mem_used: $memU, mem_total: $memT, mem_pct: pct($memU; $memT),
+             pods: ($podsOn[$nn] // 0), pods_max: (.status.allocatable.pods | tonumber),
+             age: (.metadata.creationTimestamp | age)}]
       },
       pods: {
         total: ($items | length), healthy: $healthy,
@@ -164,27 +267,48 @@ check() { # $1 = kubeconfig, $2 = optional namespace/service:port of Alertmanage
                  restarts: ([.status.containerStatuses[]?.restartCount] | add // 0),
                  age: (.metadata.creationTimestamp | age)}))
       }
-    }' > "$tmp/$name.json"
+    }' > "$tmp/c/$name.json"
 }
 
 # clusters file: "<kubeconfig> [namespace/service:port of Alertmanager]" per line
 while read -r kc am; do
   [ -n "$kc" ] && [ "${kc:0:1}" != "#" ] && check "${kc/#\~/$HOME}" "$am" &
 done < "$CONF/clusters"
+i=0
+while read -r spec; do
+  [ -n "$spec" ] && [ "${spec:0:1}" != "#" ] && { i=$((i + 1)); pipeline "$spec" "$tmp/p/$(printf %03d $i)" & }
+done < "$CONF/repos"
 wait
 
-jq -s --argjson m "$(muted_until)" '{updated: (now | todate), muted_until: $m, clusters: .}' "$tmp"/*.json > "$tmp/status"
+jq -n --argjson m "$(muted_until)" --argjson cpu "$NODE_CPU_MAX" --argjson mem "$NODE_MEM_MAX" --argjson health "$HEALTH_MIN" \
+  --slurpfile c <(cat "$tmp"/c/*.json 2>/dev/null) --slurpfile p <(cat "$tmp"/p/[0-9][0-9][0-9] 2>/dev/null) \
+  '{updated: (now | todate), muted_until: $m, thresholds: {node_cpu: $cpu, node_mem: $mem, health: $health},
+    clusters: $c, pipelines: $p}' > "$tmp/status"
 cp "$tmp/status" "$CACHE/status.json.tmp" && mv "$CACHE/status.json.tmp" "$CACHE/status.json"
 
 # Problems worth a notification. Lines must be stable between runs (no changing numbers), since
 # notifications fire on lines that appear or disappear. Warnings stay in the UI only.
-problems() { jq -r --argjson min "$HEALTH_MIN" '.clusters[] | .name as $c
-  | (if .up then empty else "\($c): API unreachable" end),
-    (if .watchdog == false then "\($c): Watchdog missing (alerting pipeline dead)" else empty end),
-    (.alerts[] | select(.severity == "critical") | "\($c): \(.name) \(.ns) \(.msg)"),
-    (.nodes.notready[]? | "\($c): node \(.) NotReady"),
-    (if .up and .pods.pct != null and .pods.pct < $min then "\($c): pod health below \($min)%" else empty end),
-    (.pods.recent[] | select(.reason | test("CrashLoopBackOff|OOMKilled")) | "\($c): \(.ns)/\(.name) \(.reason)")' | sort -u; }
+# Node usage lines only clear 5 points below the threshold, so a node hovering at the limit does not flap.
+# Each rule can be turned off with NOTIFY_<RULE>=0; all are on by default.
+problems() { jq -r --argjson min "$HEALTH_MIN" --argjson cpumax "$NODE_CPU_MAX" --argjson memmax "$NODE_MEM_MAX" \
+  --rawfile prev <(cat "$CACHE/notified" 2>/dev/null) --rawfile s <(cat "$CONF/settings.env" 2>/dev/null) '
+  ($prev | split("\n")) as $was |
+  ([$s | split("\n")[] | capture("^NOTIFY_(?<key>[A-Z_]+)=(?<value>.*)$")] | from_entries) as $flags |
+  def on($rule): $flags[$rule] != "0";
+  def over($line; $pct; $max): if $pct != null and ($pct >= $max or ($pct >= $max - 5 and ($was | index($line)))) then $line else empty end;
+  (.clusters[] | .name as $c
+    | (if on("API") and (.up | not) then "\($c): API unreachable" else empty end),
+      (if on("WATCHDOG") and .watchdog == false then "\($c): Watchdog missing (alerting pipeline dead)" else empty end),
+      (if on("CRITICAL") then .alerts[] | select(.severity == "critical") | "\($c): \(.name) \(.ns) \(.msg)" else empty end),
+      (if on("NODE_NOTREADY") then .nodes.notready[]? | "\($c): node \(.) NotReady" else empty end),
+      (.nodes.list[]? |
+         (if on("NODE_PRESSURE") then .pressure[] as $p | "\($c): node \(.name) \($p)" else empty end),
+         (if on("NODE_CPU") then over("\($c): node \(.name) CPU above \($cpumax)%"; .cpu_pct; $cpumax) else empty end),
+         (if on("NODE_MEM") then over("\($c): node \(.name) RAM above \($memmax)%"; .mem_pct; $memmax) else empty end)),
+      (if on("POD_HEALTH") and .up and .pods.pct != null and .pods.pct < $min then "\($c): pod health below \($min)%" else empty end),
+      (if on("CRASHLOOP") then .pods.recent[] | select(.reason | test("CrashLoopBackOff|OOMKilled")) | "\($c): \(.ns)/\(.name) \(.reason)" else empty end)),
+  (if on("PIPELINES") then .pipelines[]? | select(.last_finished == "failed") | "\(.name)@\(.branch): pipeline failed" else empty end)
+  ' | sort -u; }
 problems < "$tmp/status" > "$tmp/problems"
 
 # $CACHE/notified = problems last announced. The first run only records them, so installing
@@ -193,7 +317,7 @@ if [ ! -f "$CACHE/notified" ]; then cp "$tmp/problems" "$CACHE/notified"; exit 0
 [ "$(muted_until)" != 0 ] && exit 0
 fired=$(comm -13 "$CACHE/notified" "$tmp/problems")
 resolved=$(comm -23 "$CACHE/notified" "$tmp/problems")
-[ -n "$fired" ] && send critical "🔴 Cluster problem" "$fired" >/dev/null
+[ -n "$fired" ] && send critical "🔴 Problem" "$fired" >/dev/null
 [ -n "$resolved" ] && send normal "✅ Resolved" "$resolved" >/dev/null
 cp "$tmp/problems" "$CACHE/notified"
 exit 0

@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# Checks every cluster in ~/.config/cluster-health/clusters (one kubeconfig path per line),
+# writes ~/.cache/cluster-health/status.json and notifies (desktop + Telegram) on changes.
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/cluster-health"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/cluster-health"
+mkdir -p "$CONF" "$CACHE"
+[ -f "$CONF/clusters" ] || echo "${KUBECONFIG:-$HOME/.kube/config}" > "$CONF/clusters"
+
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+
+check() { # $1 = kubeconfig, writes $tmp/<name>.json
+  local kc=$1 name d
+  name=$(basename "${kc%.*}"); d="$tmp/$name"; mkdir -p "$d"
+  k() { KUBECONFIG=$kc timeout 15 kubectl "$@" 2>/dev/null; }
+  # One retry so a single slow request is not reported as an outage.
+  if [ "$(k get --raw /readyz)" != "ok" ] && { sleep 3; [ "$(k get --raw /readyz)" != "ok" ]; }; then
+    jq -n --arg n "$name" '{name:$n, up:false, watchdog:null, alerts:[], events:[], pods:{total:0,healthy:0,pct:0,namespaces:[],recent:[]}}' > "$tmp/$name.json"
+    return
+  fi
+  # watchdog: null = cluster has no alertmanager, false = alertmanager exists but Watchdog not firing/unreachable
+  local am=false
+  k get svc -n monitoring alertmanager -o name >/dev/null && am=true
+  k get --raw "/api/v1/namespaces/monitoring/services/alertmanager:9093/proxy/api/v2/alerts?active=true&silenced=false&inhibited=false" > "$d/a" || echo '[]' > "$d/a"
+  k get pods -A -o json > "$d/p" || echo '{}' > "$d/p"
+  k get events -A --field-selector type=Warning -o json > "$d/e" || echo '{}' > "$d/e"
+  jq -n --arg n "$name" --argjson am "$am" --slurpfile A "$d/a" --slurpfile P "$d/p" --slurpfile E "$d/e" '
+    $A[0] as $a | $P[0] as $p | $E[0] as $e |
+    def age: (now - (sub("\\.[0-9]+"; "") | fromdateiso8601)) | floor
+      | if . < 3600 then "\(./60|floor)m" elif . < 86400 then "\(./3600|floor)h" else "\(./86400|floor)d" end;
+    def ok: .status.phase == "Succeeded"
+      or (.status.phase == "Running" and ([.status.containerStatuses[]?.ready] | all));
+    def sev: {"critical":0,"warning":1}[.] // 2;
+    ($p.items // []) as $items
+    | ([$items[] | select(ok)] | length) as $healthy
+    | {
+      name: $n, up: true,
+      watchdog: (if $am then ([$a[]? | select(.labels.alertname == "Watchdog")] | length > 0) else null end),
+      alerts: ([$a[]? | select(.labels.alertname | IN("Watchdog","InfoInhibitor") | not)
+               | {name: .labels.alertname, ns: (.labels.namespace // ""), severity: (.labels.severity // ""),
+                  msg: (.annotations.summary // .annotations.description // "")}]
+               | sort_by(.severity | sev)),
+      events: ([($e.items // [])[] | . + {t: (.lastTimestamp // .eventTime // .metadata.creationTimestamp)}]
+               | sort_by(.t) | reverse | .[:15]
+               | map({ns: .metadata.namespace, obj: "\(.involvedObject.kind)/\(.involvedObject.name)",
+                      reason: .reason, msg: (.message | split("\n")[0] | .[:200]), age: (.t | age)})),
+      pods: {
+        total: ($items | length), healthy: $healthy,
+        pct: (if ($items | length) == 0 then 0 else $healthy * 100 / ($items | length) | floor end),
+        namespaces: ([$items[].metadata.namespace] | unique),
+        recent: ($items | sort_by(.metadata.creationTimestamp) | reverse
+          | map((([.status.containerStatuses[]?.state | .waiting.reason // .terminated.reason // empty
+                  | select(. != "Completed")] | first) // .status.reason // "") as $reason
+            | {ns: .metadata.namespace, name: .metadata.name, phase: .status.phase, ok: ok,
+                 reason: $reason,
+                 state: (if .status.phase == "Succeeded" then "done"
+                         elif (.status.phase | IN("Failed","Unknown")) or ($reason | test("BackOff|Err|Error|OOM|Invalid")) then "bad"
+                         elif ok then "ok" else "pending" end),
+                 ready: "\([.status.containerStatuses[]? | select(.ready)] | length)/\(.spec.containers | length)",
+                 restarts: ([.status.containerStatuses[]?.restartCount] | add // 0),
+                 age: (.metadata.creationTimestamp | age)}))
+      }
+    }' > "$tmp/$name.json"
+}
+
+while read -r kc; do
+  [ -n "$kc" ] && [ "${kc:0:1}" != "#" ] && check "${kc/#\~/$HOME}" &
+done < "$CONF/clusters"
+wait
+
+new=$(jq -s '{updated: (now | todate), clusters: .}' "$tmp"/*.json)
+old=$(cat "$CACHE/status.json" 2>/dev/null || echo "$new")
+echo "$new" > "$CACHE/status.json.tmp" && mv "$CACHE/status.json.tmp" "$CACHE/status.json"
+
+# Problems worth a notification: API down, Watchdog missing, critical alerts. Warnings stay in the UI only.
+problems() { jq -r '.clusters[] | .name as $c
+  | (if .up then empty else "\($c): API unreachable" end),
+    (if .watchdog == false then "\($c): Watchdog missing (alerting pipeline dead)" else empty end),
+    (.alerts[] | select(.severity == "critical") | "\($c): \(.name) \(.ns) \(.msg)")' | sort -u; }
+fired=$(comm -13 <(problems <<<"$old") <(problems <<<"$new"))
+resolved=$(comm -23 <(problems <<<"$old") <(problems <<<"$new"))
+
+notify() { # $1 urgency, $2 title, $3 body
+  notify-send -a "Cluster Health" -u "$1" "$2" "$3" 2>/dev/null
+  [ -f "$CONF/telegram.env" ] && . "$CONF/telegram.env" && [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ] &&
+    curl -s -m 10 "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+      --data-urlencode "chat_id=$TG_CHAT" --data-urlencode "text=$2
+$3" >/dev/null
+}
+[ -n "$fired" ] && notify critical "🔴 Cluster problem" "$fired"
+[ -n "$resolved" ] && notify normal "✅ Resolved" "$resolved"
+exit 0

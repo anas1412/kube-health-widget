@@ -1,0 +1,14 @@
+{
+    "KPlugin": {
+        "Id": "dev.anas.clusterhealth",
+        "Name": "Cluster Health",
+        "Description": "Kubernetes cluster health, alerts and recent pods",
+        "Icon": "kubernetes",
+        "Category": "System Information",
+        "Authors": [{ "Name": "anas1412" }],
+        "License": "MIT",
+        "Version": "1.0"
+    },
+    "KPackageStructure": "Plasma/Applet",
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

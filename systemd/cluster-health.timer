@@ -1,0 +1,9 @@
+[Unit]
+Description=Check Kubernetes cluster health every minute
+
+[Timer]
+OnActiveSec=5s
+OnUnitInactiveSec=60s
+
+[Install]
+WantedBy=timers.target

@@ -5,13 +5,13 @@ import org.kde.kirigami as Kirigami
 import org.kde.kcmutils as KCM
 import org.kde.plasma.plasma5support as P5Support
 
-// Settings live in ~/.config/cluster-health (shared with GNOME); all reads and writes go through
-// the cluster-health command. Values are passed base64-encoded so nothing typed reaches the shell.
+// Settings live in ~/.config/kube-health (shared with GNOME); all reads and writes go through
+// the kube-health command. Values are passed base64-encoded so nothing typed reaches the shell.
 KCM.SimpleKCM {
     id: page
     signal configurationChanged
 
-    readonly property string bin: "\"$HOME/.local/bin/cluster-health\""
+    readonly property string bin: "\"$HOME/.local/bin/kube-health\""
     readonly property string getCmd: bin + " --get"
     readonly property var mutes: [["Not muted", "off"], ["1 hour", "3600"], ["4 hours", "14400"], ["8 hours", "28800"],
                                   ["24 hours", "86400"], ["Until I unmute", "forever"]]
@@ -33,7 +33,7 @@ KCM.SimpleKCM {
             + "; echo " + b64(clusters.text.trim() + "\n") + " | base64 -d | " + bin + " --clusters"
         if (mute.currentIndex > 0 || mutedUntil !== 0)
             cmd += "; " + bin + " --mute " + mutes[mute.currentIndex][1]
-        return cmd + "; systemctl --user start cluster-health.service --no-block"
+        return cmd + "; systemctl --user start kube-health.service --no-block"
     }
     function saveConfig() { exec.connectSource(saveCmd() + " #save" + Date.now()) }
 
@@ -56,7 +56,7 @@ KCM.SimpleKCM {
                     discord.text = v.DISCORD_WEBHOOK || ""
                     page.mutedUntil = s.muted_until
                 } catch (e) {
-                    page.testResult = "Could not load settings. Is cluster-health installed in ~/.local/bin?"
+                    page.testResult = "Could not load settings. Is kube-health installed in ~/.local/bin?"
                 }
                 page.loading = false
             } else if (source.includes("#test")) {

@@ -1,0 +1,7 @@
+[Unit]
+Description=Update kube-health-widget from GitHub
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/share/kube-health/install.sh --update

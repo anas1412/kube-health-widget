@@ -1,5 +1,5 @@
 [Unit]
-Description=Update cluster-health daily
+Description=Update kube-health-widget daily
 
 [Timer]
 OnCalendar=daily

@@ -3,4 +3,4 @@ Description=Check Kubernetes cluster health
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/bin/cluster-health
+ExecStart=%h/.local/bin/kube-health

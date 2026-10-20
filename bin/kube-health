@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Checks every cluster in ~/.config/cluster-health/clusters, writes ~/.cache/cluster-health/status.json
+# Checks every cluster in ~/.config/kube-health/clusters, writes ~/.cache/kube-health/status.json
 # and notifies (desktop, Telegram, Slack, Mattermost, Discord) on changes.
-#   cluster-health          run one check
-#   cluster-health --test   send a test message to every configured target
-CONF="${XDG_CONFIG_HOME:-$HOME/.config}/cluster-health"
-CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/cluster-health"
+#   kube-health          run one check
+#   kube-health --test   send a test message to every configured target
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/kube-health"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/kube-health"
 mkdir -p "$CONF" "$CACHE"
 [ -f "$CONF/clusters" ] || echo "${KUBECONFIG:-$HOME/.kube/config}" > "$CONF/clusters"
 [ -f "$CONF/telegram.env" ] && [ ! -f "$CONF/settings.env" ] && mv "$CONF/telegram.env" "$CONF/settings.env"
@@ -18,7 +18,7 @@ send() { # $1 urgency, $2 title, $3 body; prints one result line per target
   local text="$2
 $3" r tok chat
   if [ "$(cfg NOTIFY_DESKTOP)" != 0 ]; then
-    notify-send -a "Cluster Health" -u "$1" "$2" "$3" 2>/dev/null && echo "desktop: ok" || echo "desktop: failed"
+    notify-send -a "Kube Health" -u "$1" "$2" "$3" 2>/dev/null && echo "desktop: ok" || echo "desktop: failed"
   fi
   tok=$(cfg TG_TOKEN); chat=$(cfg TG_CHAT)
   if [ -n "$tok" ] && [ -n "$chat" ]; then
@@ -55,7 +55,7 @@ muted_until() { # epoch seconds, 0 = not muted, -1 = muted until unmuted
 # Commands used by the KDE and GNOME settings UIs.
 case "$1" in
   --test)
-    send normal "✅ Cluster Health test" "Notifications are working."
+    send normal "✅ Kube Health test" "Notifications are working."
     exit 0 ;;
   --get)
     touch "$CONF/settings.env"
@@ -74,7 +74,7 @@ case "$1" in
     case "$2" in
       off|0) v=0 ;;
       forever) v=forever ;;
-      ''|*[!0-9]*) echo "usage: cluster-health --mute <seconds|forever|off>" >&2; exit 1 ;;
+      ''|*[!0-9]*) echo "usage: kube-health --mute <seconds|forever|off>" >&2; exit 1 ;;
       *) v=$(( $(date +%s) + $2 )) ;;
     esac
     echo "MUTE_UNTIL=$v" | set_cfg

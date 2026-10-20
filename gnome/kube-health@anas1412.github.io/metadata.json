@@ -1,0 +1,7 @@
+{
+    "uuid": "kube-health@anas1412.github.io",
+    "name": "Kube Health",
+    "description": "Kubernetes cluster health, alerts and recent pods in the top bar",
+    "url": "https://github.com/anas1412/kube-health-widget",
+    "shell-version": ["45", "46", "47", "48", "49"]
+}

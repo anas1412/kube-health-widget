@@ -1,4 +1,4 @@
-<p align="center"><img src="icons/cluster-health.svg" width="96" alt=""></p>
+<p align="center"><img src="icons/kube-health.svg" width="96" alt=""></p>
 
 # kube-health-widget
 
@@ -35,8 +35,8 @@ curl -fsSL https://raw.githubusercontent.com/anas1412/kube-health-widget/main/in
 
 No root needed. The installer:
 
-1. clones this repo to `~/.local/share/cluster-health`
-2. installs the checker to `~/.local/bin/cluster-health`
+1. clones this repo to `~/.local/share/kube-health`
+2. installs the checker to `~/.local/bin/kube-health`
 3. starts two systemd user timers: checks every minute, updates daily
 4. installs the KDE widget and/or the GNOME extension, depending on what is installed
 
@@ -44,14 +44,14 @@ Then put it in your panel:
 
 | Desktop | Steps |
 | --- | --- |
-| KDE | Right-click the panel > **Add or Manage Widgets** > search **Cluster Health** > drag it onto the panel |
-| GNOME | Log out and back in, then run `gnome-extensions enable cluster-health@anas.dev` |
+| KDE | Right-click the panel > **Add or Manage Widgets** > search **Kube Health** > drag it onto the panel |
+| GNOME | Log out and back in, then run `gnome-extensions enable kube-health@anas1412.github.io` |
 
 ## Settings
 
 | Desktop | Open settings |
 | --- | --- |
-| KDE | Gear icon in the widget, or right-click the widget > **Configure Cluster Health** |
+| KDE | Gear icon in the widget, or right-click the widget > **Configure Kube Health** |
 | GNOME | **Settings…** in the menu, or the Extensions app |
 
 Both write the same files, so settings carry over between desktops.
@@ -154,26 +154,26 @@ While muted, the widget keeps updating and shows 🔕, but nothing is sent. When
 Automatic. Once a day the update timer pulls `main`, reinstalls if anything changed, and shows a desktop notification. Checker changes apply on the next check; widget changes load after you log out and back in.
 
 ```bash
-~/.local/share/cluster-health/install.sh --update              # update now
-systemctl --user disable --now cluster-health-update.timer     # turn off auto-update
+~/.local/share/kube-health/install.sh --update              # update now
+systemctl --user disable --now kube-health-update.timer     # turn off auto-update
 ```
 
 ## Uninstall
 
 ```bash
-~/.local/share/cluster-health/install.sh --uninstall
+~/.local/share/kube-health/install.sh --uninstall
 ```
 
-Removes the checker, timers, widget, extension and icon. Settings in `~/.config/cluster-health` are kept.
+Removes the checker, timers, widget, extension and icon. Settings in `~/.config/kube-health` are kept.
 
 ## Command line
 
 ```bash
-cluster-health                        # run a check now
-cluster-health --test                 # send a test message to every configured target
-cluster-health --mute 3600            # mute for 1 hour (seconds), or: --mute forever, --mute off
-cluster-health --set HEALTH_MIN=90    # change a setting
-cluster-health --get                  # print all settings as JSON
+kube-health                        # run a check now
+kube-health --test                 # send a test message to every configured target
+kube-health --mute 3600            # mute for 1 hour (seconds), or: --mute forever, --mute off
+kube-health --set HEALTH_MIN=90    # change a setting
+kube-health --get                  # print all settings as JSON
 ```
 
 Setting keys: `NOTIFY_DESKTOP`, `HEALTH_MIN`, `TG_TOKEN`, `TG_CHAT`, `SLACK_WEBHOOK`, `MATTERMOST_WEBHOOK`, `DISCORD_WEBHOOK`, `MUTE_UNTIL`.
@@ -181,36 +181,36 @@ Setting keys: `NOTIFY_DESKTOP`, `HEALTH_MIN`, `TG_TOKEN`, `TG_CHAT`, `SLACK_WEBH
 ## How it works
 
 ```
-cluster-health.timer (every 60s)
-  └─ cluster-health ──kubectl──> each cluster
-       ├─ ~/.cache/cluster-health/status.json ──> KDE widget / GNOME extension (read only)
+kube-health.timer (every 60s)
+  └─ kube-health ──kubectl──> each cluster
+       ├─ ~/.cache/kube-health/status.json ──> KDE widget / GNOME extension (read only)
        └─ on change, unless muted: desktop, Telegram, Slack, Mattermost, Discord
 
-cluster-health-update.timer (daily)
+kube-health-update.timer (daily)
   └─ install.sh --update: git pull, reinstall if changed
 ```
 
-The checker is plain bash and works on any desktop. The panel UIs read `status.json` and change settings only through the `cluster-health` command, so they never call the cluster themselves.
+The checker is plain bash and works on any desktop. The panel UIs read `status.json` and change settings only through the `kube-health` command, so they never call the cluster themselves.
 
 | Path | Content |
 | --- | --- |
-| `~/.config/cluster-health/clusters` | kubeconfig list |
-| `~/.config/cluster-health/settings.env` | settings and secrets (mode 600, read as text, never executed) |
-| `~/.cache/cluster-health/status.json` | latest state of all clusters |
-| `~/.cache/cluster-health/notified` | problems already notified |
-| `~/.local/share/cluster-health` | installed copy of this repo |
+| `~/.config/kube-health/clusters` | kubeconfig list |
+| `~/.config/kube-health/settings.env` | settings and secrets (mode 600, read as text, never executed) |
+| `~/.cache/kube-health/status.json` | latest state of all clusters |
+| `~/.cache/kube-health/notified` | problems already notified |
+| `~/.local/share/kube-health` | installed copy of this repo |
 
 ## Troubleshooting
 
 ```bash
-jq '.clusters[] | {name, up, watchdog, alertmanager, pct: .pods.pct}' ~/.cache/cluster-health/status.json
-systemctl --user list-timers 'cluster-health*'
-journalctl --user -u cluster-health.service -u cluster-health-update.service
+jq '.clusters[] | {name, up, watchdog, alertmanager, pct: .pods.pct}' ~/.cache/kube-health/status.json
+systemctl --user list-timers 'kube-health*'
+journalctl --user -u kube-health.service -u kube-health-update.service
 ```
 
 | Symptom | Fix |
 | --- | --- |
-| Widget shows `?` | No status yet. Run `cluster-health`, then check that `kubectl` works with each kubeconfig. |
+| Widget shows `?` | No status yet. Run `kube-health`, then check that `kubectl` works with each kubeconfig. |
 | Widget not in the Add Widgets list (KDE) | Run `systemctl --user restart plasma-plasmashell` |
 | A target gets no messages | Use **Save and send test message**; it shows the error for each target. |
 | Watchdog `n/a` | No Alertmanager found. Set it by hand in the clusters list. |

@@ -4,9 +4,9 @@ import GLib from 'gi://GLib';
 import Gtk from 'gi://Gtk';
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
-// Settings live in ~/.config/cluster-health (shared with KDE); all reads and writes go through
-// the cluster-health command, called with an argv array so nothing passes through a shell.
-const BIN = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'cluster-health']);
+// Settings live in ~/.config/kube-health (shared with KDE); all reads and writes go through
+// the kube-health command, called with an argv array so nothing passes through a shell.
+const BIN = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'kube-health']);
 const MUTES = [['Not muted', 'off'], ['1 hour', '3600'], ['4 hours', '14400'], ['8 hours', '28800'],
     ['24 hours', '86400'], ['Until I unmute', 'forever']];
 
@@ -27,7 +27,7 @@ function run(args, input = null) {
 
 const desc = text => new Gtk.Label({label: text, wrap: true, xalign: 0, css_classes: ['dim-label', 'caption'], margin_top: 6});
 
-export default class ClusterHealthPrefs extends ExtensionPreferences {
+export default class KubeHealthPrefs extends ExtensionPreferences {
     async fillPreferencesWindow(window) {
         let s = {clusters: '', settings: {}, muted_until: 0};
         try {
@@ -96,7 +96,7 @@ export default class ClusterHealthPrefs extends ExtensionPreferences {
             await run(['--clusters'], `${buffer.text.trim()}\n`);
             if (mute.selected > 0 || s.muted_until !== 0)
                 await run(['--mute', MUTES[mute.selected][1]]);
-            GLib.spawn_command_line_async('systemctl --user start cluster-health.service --no-block');
+            GLib.spawn_command_line_async('systemctl --user start kube-health.service --no-block');
         };
 
         // Actions

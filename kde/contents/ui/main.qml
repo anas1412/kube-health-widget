@@ -16,8 +16,8 @@ PlasmoidItem {
     property bool problemsOnly: false
     property string sevFilter: ""
 
-    readonly property string bin: "\"$HOME/.local/bin/cluster-health\""
-    readonly property string loadCmd: "cat \"${XDG_CACHE_HOME:-$HOME/.cache}/cluster-health/status.json\""
+    readonly property string bin: "\"$HOME/.local/bin/kube-health\""
+    readonly property string loadCmd: "cat \"${XDG_CACHE_HOME:-$HOME/.cache}/kube-health/status.json\""
 
     function byNs(list) { return list.filter(x => !nsFilter || x.ns === nsFilter) }
     function bad(c) { return !c.up || c.watchdog === false }
@@ -63,13 +63,13 @@ PlasmoidItem {
         }
     }
     function load() { exec.connectSource(loadCmd) }
-    function refresh() { exec.connectSource("systemctl --user start cluster-health.service; true #refresh"); refreshTimer.start() }
+    function refresh() { exec.connectSource("systemctl --user start kube-health.service; true #refresh"); refreshTimer.start() }
     function mute(arg) { exec.connectSource(bin + " --mute " + arg + " #mute" + Date.now()) }
     Timer { interval: 15000; running: true; repeat: true; triggeredOnStart: true; onTriggered: root.load() }
     Timer { id: refreshTimer; interval: 12000; onTriggered: root.load() }
 
-    Plasmoid.icon: "cluster-health"
-    toolTipMainText: "Cluster Health"
+    Plasmoid.icon: "kube-health"
+    toolTipMainText: "Kube Health"
     toolTipSubText: clusters.map(c => `${c.name}: ${c.up ? pct(c) : "DOWN"}`).join("\n") + (mutedUntil ? "\n🔕 " + muteText() : "")
 
     compactRepresentation: MouseArea {

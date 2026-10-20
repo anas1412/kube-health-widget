@@ -4,7 +4,7 @@ import org.kde.plasma.configuration
 ConfigModel {
     ConfigCategory {
         name: "General"
-        icon: "cluster-health"
+        icon: "kube-health"
         source: "configGeneral.qml"
     }
 }

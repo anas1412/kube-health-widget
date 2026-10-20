@@ -7,7 +7,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
-const STATUS = GLib.build_filenamev([GLib.get_user_cache_dir(), 'cluster-health', 'status.json']);
+const STATUS = GLib.build_filenamev([GLib.get_user_cache_dir(), 'kube-health', 'status.json']);
 const POD_DOT = {ok: '🟢', pending: '🟠', bad: '🔴', done: '⚪'};
 const bad = c => !c.up || c.watchdog === false;
 const pct = c => c.pods.pct == null ? '?' : `${c.pods.pct}%`;
@@ -15,22 +15,22 @@ const dot = c => bad(c) ? '🔴'
     : ((c.pods.pct ?? 100) < 95 || c.alerts.some(a => a.severity === 'critical') || (c.nodes?.notready.length ?? 0) > 0) ? '🟠'
     : '🟢';
 const SEVERITIES = ['', 'critical', 'warning', 'info'];
-const BIN = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'cluster-health']);
+const BIN = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'kube-health']);
 const MUTES = [['Mute for 1 hour', '3600'], ['Mute for 4 hours', '14400'], ['Mute for 8 hours', '28800'],
     ['Mute for 24 hours', '86400'], ['Mute until I unmute', 'forever']];
 const muteText = m => m === -1 ? 'Muted until you unmute'
     : `Muted until ${GLib.DateTime.new_from_unix_local(m).format('%H:%M')}`;
 
-export default class ClusterHealth extends Extension {
+export default class KubeHealth extends Extension {
     enable() {
         this._status = null;
         this._nsFilter = '';
         this._problemsOnly = false;
         this._sevFilter = '';
-        this._button = new PanelMenu.Button(0.0, 'Cluster Health', false);
+        this._button = new PanelMenu.Button(0.0, 'Kube Health', false);
         const box = new St.BoxLayout({style_class: 'panel-status-menu-box'});
         box.add_child(new St.Icon({
-            gicon: Gio.icon_new_for_string(`${this.path}/cluster-health.svg`),
+            gicon: Gio.icon_new_for_string(`${this.path}/kube-health.svg`),
             style_class: 'system-status-icon',
         }));
         this._label = new St.Label({text: '…', y_align: Clutter.ActorAlign.CENTER});
@@ -132,7 +132,7 @@ export default class ClusterHealth extends Extension {
         menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem(`Updated ${this._status.updated}`));
         const refresh = new PopupMenu.PopupMenuItem('Refresh now');
         refresh.connect('activate', () => {
-            GLib.spawn_command_line_async('systemctl --user start cluster-health.service');
+            GLib.spawn_command_line_async('systemctl --user start kube-health.service');
             GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 12, () => { this._load(); return GLib.SOURCE_REMOVE; });
         });
         menu.addMenuItem(refresh);

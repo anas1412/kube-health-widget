@@ -1,15 +1,15 @@
 {
     "KPlugin": {
-        "Id": "dev.anas.clusterhealth",
-        "Name": "Cluster Health",
+        "Id": "io.github.anas1412.kubehealth",
+        "Name": "Kube Health",
         "Description": "Kubernetes cluster health, alerts and recent pods",
-        "Icon": "cluster-health",
+        "Icon": "kube-health",
         "Category": "System Information",
         "Authors": [{ "Name": "anas1412" }],
         "Website": "https://github.com/anas1412/kube-health-widget",
         "BugReportUrl": "https://github.com/anas1412/kube-health-widget/issues",
         "License": "MIT",
-        "Version": "1.1"
+        "Version": "1.2"
     },
     "KPackageStructure": "Plasma/Applet",
     "X-Plasma-API-Minimum-Version": "6.0"

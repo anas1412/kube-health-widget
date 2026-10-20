@@ -1,7 +1,0 @@
-[Unit]
-Description=Update cluster-health from GitHub
-After=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=%h/.local/share/cluster-health/install.sh --update

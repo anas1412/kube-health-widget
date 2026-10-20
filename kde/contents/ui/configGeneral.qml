@@ -40,13 +40,29 @@ KCM.SimpleKCM {
     property var selectedRepos: []
     property bool reposLoading: true
     property string repoSearch: ""
-    // No search: the selected repos. Searching: the first 10 matches.
+    // Ids are kind:repo@branch; a repo tracked on several branches has one id per branch.
+    function base(id) { return id.replace(/@[^@]*$/, "") }
+    function branch(id) { return id.includes("@") ? id.split("@").pop() : "" }
+    function repoName(id) { return base(id).replace(/^[a-z]+:/, "") }
+    readonly property var trackedBases: selectedRepos.map(base).filter((b, i, a) => a.indexOf(b) === i)
+    // No search: the tracked repos. Searching: the first 10 matches.
     readonly property var repoMatches: allRepos.filter(r => r.name.toLowerCase().includes(repoSearch))
     readonly property var repoModel: repoSearch ? repoMatches.slice(0, 10)
-        : selectedRepos.map(id => allRepos.find(r => r.id === id)
-            || {id: id, name: id.replace(/^[a-z]+:/, "").replace(/@.*$/, ""), source: id.split(":")[0]})
+        : trackedBases.map(b => ({id: b, name: repoName(b), source: b.split(":")[0],
+                                  branches: selectedRepos.filter(id => base(id) === b).map(branch).join(", ")}))
     function toggleRepo(id, on) {
-        selectedRepos = on ? selectedRepos.concat([id]) : selectedRepos.filter(x => x !== id)
+        const b = base(id)
+        selectedRepos = on ? (trackedBases.includes(b) ? selectedRepos : selectedRepos.concat([id]))
+                           : selectedRepos.filter(x => base(x) !== b)
+        changed()
+    }
+    function setBranches(b, text) {
+        const branches = text.split(",").map(s => s.trim()).filter(s => s)
+        if (branches.length === 0) return
+        const ids = branches.map(br => b + "@" + br)
+        const at = selectedRepos.findIndex(x => base(x) === b)
+        const rest = selectedRepos.filter(x => base(x) !== b)
+        selectedRepos = rest.slice(0, at).concat(ids, rest.slice(at))
         changed()
     }
     function setRule(key, on) { const r = Object.assign({}, ruleOn); r[key] = on; ruleOn = r; changed() }
@@ -58,6 +74,7 @@ KCM.SimpleKCM {
     function settingsText() {
         return rules.map(r => "NOTIFY_" + r.key + "=" + (ruleOn[r.key] !== false ? 1 : 0))
             .concat(Object.keys(limits).map(k => k + "=" + limits[k]))
+            .concat(["PIPE_HISTORY=" + pipeHistory.value, "PIPE_MRS=" + (pipeMrs.checked ? 1 : 0)])
             .concat(["NOTIFY_DESKTOP=" + (desktop.checked ? 1 : 0),
                      "TG_TOKEN=" + tgToken.text.trim(), "TG_CHAT=" + tgChat.text.trim(),
                      "SLACK_WEBHOOK=" + slack.text.trim(), "MATTERMOST_WEBHOOK=" + mattermost.text.trim(),
@@ -90,6 +107,8 @@ KCM.SimpleKCM {
                     page.limits = {NODE_CPU_MAX: parseInt(v.NODE_CPU_MAX || "90"), NODE_MEM_MAX: parseInt(v.NODE_MEM_MAX || "90"),
                                    HEALTH_MIN: parseInt(v.HEALTH_MIN || "95")}
                     desktop.checked = v.NOTIFY_DESKTOP !== "0"
+                    pipeHistory.value = parseInt(v.PIPE_HISTORY || "5")
+                    pipeMrs.checked = v.PIPE_MRS !== "0"
                     tgToken.text = v.TG_TOKEN || ""
                     tgChat.text = v.TG_CHAT || ""
                     slack.text = v.SLACK_WEBHOOK || ""
@@ -147,16 +166,31 @@ KCM.SimpleKCM {
             onTextChanged: page.repoSearch = text.trim().toLowerCase()
         }
         ColumnLayout {
-            Kirigami.FormData.label: page.repoSearch ? "Matches:" : "Tracked (" + page.selectedRepos.length + "):"
+            Kirigami.FormData.label: page.repoSearch ? "Matches:" : "Tracked (" + page.trackedBases.length + "):"
             Layout.fillWidth: true
             spacing: 0
             Repeater {
                 model: page.repoModel
-                QQC2.CheckBox {
+                RowLayout {
                     required property var modelData
-                    text: modelData.name + "   ·   " + modelData.source + ", " + modelData.id.split("@").pop()
-                    checked: page.selectedRepos.includes(modelData.id)
-                    onToggled: page.toggleRepo(modelData.id, checked)
+                    Layout.fillWidth: true
+                    QQC2.CheckBox {
+                        Layout.fillWidth: true
+                        text: modelData.name + "   ·   " + modelData.source
+                            + (page.repoSearch ? ", " + page.branch(modelData.id) : "")
+                        checked: page.trackedBases.includes(page.base(modelData.id))
+                        onToggled: page.toggleRepo(modelData.id, checked)
+                    }
+                    // Tracked repos: comma-separated branches, e.g. "main, develop".
+                    QQC2.TextField {
+                        visible: !page.repoSearch
+                        Layout.preferredWidth: Kirigami.Units.gridUnit * 9
+                        text: modelData.branches ?? ""
+                        placeholderText: "branches"
+                        QQC2.ToolTip.visible: hovered
+                        QQC2.ToolTip.text: "Branches to track, comma-separated, e.g. main, develop"
+                        onEditingFinished: page.setBranches(modelData.id, text)
+                    }
                 }
             }
             QQC2.Label {
@@ -168,7 +202,24 @@ KCM.SimpleKCM {
                     : (page.selectedRepos.length === 0 ? "None yet. Search above to add repositories." : "")
             }
         }
-        Hint { text: "Lists what your gh (GitHub) and glab (GitLab) logins can see. Each repo is tracked on its default branch." }
+        Hint {
+            text: "Lists what your gh (GitHub) and glab (GitLab) logins can see. A repo is added on its default branch; "
+                + "edit the branches field to track more, e.g. main, develop."
+        }
+        QQC2.SpinBox {
+            id: pipeHistory
+            Kirigami.FormData.label: "Recent runs per repo:"
+            from: 0; to: 20
+            QQC2.ToolTip.visible: hovered
+            QQC2.ToolTip.text: "Shown when you expand a repo. 0 hides them."
+            onValueModified: page.changed()
+        }
+        QQC2.CheckBox {
+            id: pipeMrs
+            Kirigami.FormData.label: "Merge / pull requests:"
+            text: "Show open MRs and PRs with their pipeline status"
+            onToggled: page.changed()
+        }
 
         // ---- What to notify about ----
         Kirigami.Separator { Kirigami.FormData.isSection: true; Kirigami.FormData.label: "Notifications" }

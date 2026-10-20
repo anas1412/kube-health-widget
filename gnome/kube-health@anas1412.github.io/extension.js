@@ -148,20 +148,36 @@ export default class KubeHealth extends Extension {
         if (pipes.length) {
             const failed = pipes.filter(p => p.status === 'failed').length;
             const running = pipes.filter(p => p.status === 'running' || p.status === 'pending').length;
-            const pipeMenu = new PopupMenu.PopupSubMenuMenuItem(
-                `Pipelines${failed ? `  🔴 ${failed}` : ''}${running ? `  🔵 ${running}` : ''}`);
+            menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem(
+                `Pipelines${failed ? `  🔴 ${failed}` : ''}${running ? `  🔵 ${running}` : ''}`));
+            // One submenu per repo: latest run, recent runs, open PRs/MRs. Every item opens in the browser.
+            const link = (label, url) => {
+                const item = new PopupMenu.PopupMenuItem(label, {reactive: !!url});
+                if (url)
+                    item.connect('activate', () => Gio.AppInfo.launch_default_for_uri(url, null));
+                return item;
+            };
             for (const p of pipes) {
                 const note = p.status !== 'failed' && p.last_finished === 'failed' ? ' (last run failed)' : '';
-                const item = new PopupMenu.PopupMenuItem(
+                const mrWord = p.id.startsWith('gitlab:') ? 'MRs' : 'PRs';
+                const repoMenu = new PopupMenu.PopupSubMenuMenuItem(
                     `${PIPE_DOT[p.status] ?? '⚪'} ${p.name}  ${p.branch}  ·  ${PIPE_TEXT[p.status] ?? p.status}${note}` +
-                    `${p.age ? `  ·  ${p.age}` : ''}${p.sha ? `\n      ${p.sha}  ${p.title ?? ''}` : ''}`,
-                    {reactive: !!p.url});
-                if (p.url)
-                    item.connect('activate', () => Gio.AppInfo.launch_default_for_uri(p.url, null));
-                pipeMenu.menu.addMenuItem(item);
+                    `${p.age ? `  ·  ${p.age}` : ''}${p.mrs?.length ? `  ·  ${p.mrs.length} ${mrWord}` : ''}`);
+                if (p.sha)
+                    repoMenu.menu.addMenuItem(link(`Open latest run: ${p.sha}  ${p.title ?? ''}`, p.url));
+                const history = (p.history ?? []).slice(1);
+                if (history.length)
+                    repoMenu.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('Recent runs'));
+                for (const h of history)
+                    repoMenu.menu.addMenuItem(link(`${PIPE_DOT[h.status] ?? '⚪'} ${h.sha}  ${h.title}  ·  ${h.age}`, h.url));
+                if (p.mrs?.length)
+                    repoMenu.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem(
+                        p.id.startsWith('gitlab:') ? 'Open merge requests' : 'Open pull requests'));
+                for (const m of p.mrs ?? [])
+                    repoMenu.menu.addMenuItem(link(`${PIPE_DOT[m.status] ?? '⚪'} ${m.ref}  ${m.title}  ·  ${m.branch}` +
+                        `${m.author ? `  ·  ${m.author}` : ''}  ·  ${m.age}`, m.url));
+                menu.addMenuItem(repoMenu);
             }
-            menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('CI'));
-            menu.addMenuItem(pipeMenu);
         }
 
         menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem(`Updated ${this._status.updated}`));

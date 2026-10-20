@@ -18,6 +18,8 @@ PlasmoidItem {
     property int section: 0            // 0 Nodes, 1 Pods, 2 Alerts, 3 Warnings
     property bool problemsOnly: false
     property string sevFilter: ""
+    property var expanded: ({})         // pipeline id -> true when its row is expanded
+    function toggleExpanded(id) { const e = Object.assign({}, expanded); e[id] = !e[id]; expanded = e }
 
     readonly property string bin: "\"$HOME/.local/bin/kube-health\""
     readonly property string loadCmd: "cat \"${XDG_CACHE_HOME:-$HOME/.cache}/kube-health/status.json\""
@@ -127,6 +129,24 @@ PlasmoidItem {
         width: Kirigami.Units.gridUnit / 2; height: width; radius: width / 2
     }
 
+    // Indented, clickable run or PR/MR row under an expanded repo.
+    component SubRow: MouseArea {
+        property string status
+        property string url
+        property string text
+        Layout.fillWidth: true
+        Layout.leftMargin: Kirigami.Units.gridUnit * 2
+        implicitHeight: subLabel.implicitHeight
+        enabled: !!url
+        cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+        onClicked: Qt.openUrlExternally(url)
+        RowLayout {
+            anchors.left: parent.left; anchors.right: parent.right
+            Dot { color: root.pipeColor(status) }
+            PlasmaComponents.Label { id: subLabel; Layout.fillWidth: true; elide: Text.ElideRight; text: parent.parent.text }
+        }
+    }
+
     // One usage line: "CPU  [=====     ]  1.9 / 3.8 cores  49%"
     component Usage: RowLayout {
         property string label
@@ -230,32 +250,87 @@ PlasmoidItem {
                 spacing: Kirigami.Units.largeSpacing
                 Repeater {
                     model: root.showPipelines ? root.pipelines : []
-                    MouseArea {
+                    ColumnLayout {
+                        id: repoBlock
+                        required property var modelData
+                        readonly property var p: modelData
+                        readonly property bool open: !!root.expanded[p.id]
+                        readonly property bool hasMore: (p.history?.length ?? 0) > 1 || (p.mrs?.length ?? 0) > 0
                         Layout.fillWidth: true
-                        implicitHeight: pipeRow.implicitHeight
-                        enabled: !!modelData.url
-                        cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
-                        onClicked: Qt.openUrlExternally(modelData.url)
+                        spacing: Kirigami.Units.smallSpacing
+
+                        // Header: click to expand, link button opens the latest run.
                         RowLayout {
-                            id: pipeRow
-                            anchors.left: parent.left; anchors.right: parent.right
-                            Dot { color: root.pipeColor(modelData.status) }
-                            ColumnLayout {
+                            Layout.fillWidth: true
+                            MouseArea {
                                 Layout.fillWidth: true
-                                spacing: 0
-                                PlasmaComponents.Label {
-                                    Layout.fillWidth: true; elide: Text.ElideRight
-                                    text: "<b>" + modelData.name + "</b>  " + modelData.branch + "  ·  "
-                                        + root.pipeText(modelData.status)
-                                        + (modelData.status !== "failed" && modelData.last_finished === "failed" ? " (last run failed)" : "")
-                                        + (modelData.age ? "  ·  " + modelData.age : "")
+                                implicitHeight: head.implicitHeight
+                                cursorShape: repoBlock.hasMore ? Qt.PointingHandCursor : Qt.ArrowCursor
+                                onClicked: if (repoBlock.hasMore) root.toggleExpanded(repoBlock.p.id)
+                                RowLayout {
+                                    id: head
+                                    anchors.left: parent.left; anchors.right: parent.right
+                                    Kirigami.Icon {
+                                        source: repoBlock.open ? "arrow-down" : "arrow-right"
+                                        opacity: repoBlock.hasMore ? 0.7 : 0
+                                        Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                                        Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                                    }
+                                    Dot { color: root.pipeColor(repoBlock.p.status) }
+                                    ColumnLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 0
+                                        PlasmaComponents.Label {
+                                            Layout.fillWidth: true; elide: Text.ElideRight
+                                            text: "<b>" + repoBlock.p.name + "</b>  " + repoBlock.p.branch + "  ·  "
+                                                + root.pipeText(repoBlock.p.status)
+                                                + (repoBlock.p.status !== "failed" && repoBlock.p.last_finished === "failed" ? " (last run failed)" : "")
+                                                + (repoBlock.p.age ? "  ·  " + repoBlock.p.age : "")
+                                                + ((repoBlock.p.mrs?.length ?? 0) ? "  ·  " + repoBlock.p.mrs.length
+                                                    + (repoBlock.p.id.startsWith("gitlab:") ? " MRs" : " PRs") : "")
+                                        }
+                                        PlasmaComponents.Label {
+                                            visible: !!repoBlock.p.sha
+                                            Layout.fillWidth: true; elide: Text.ElideRight
+                                            opacity: 0.7
+                                            text: (repoBlock.p.sha || "") + "  " + (repoBlock.p.title || "")
+                                        }
+                                    }
                                 }
-                                PlasmaComponents.Label {
-                                    visible: !!modelData.sha
-                                    Layout.fillWidth: true; elide: Text.ElideRight
-                                    opacity: 0.7
-                                    text: (modelData.sha || "") + "  " + (modelData.title || "")
-                                }
+                            }
+                            PlasmaComponents.ToolButton {
+                                visible: !!repoBlock.p.url
+                                icon.name: "document-open-remote"
+                                PlasmaComponents.ToolTip { text: "Open latest run" }
+                                onClicked: Qt.openUrlExternally(repoBlock.p.url)
+                            }
+                        }
+
+                        // Expanded: recent runs, then open PRs/MRs.
+                        PlasmaComponents.Label {
+                            visible: repoBlock.open && (repoBlock.p.history?.length ?? 0) > 1
+                            Layout.leftMargin: Kirigami.Units.gridUnit * 2
+                            text: "Recent runs"; opacity: 0.6; font: Kirigami.Theme.smallFont
+                        }
+                        Repeater {
+                            model: repoBlock.open ? (repoBlock.p.history ?? []).slice(1) : []
+                            SubRow {
+                                status: modelData.status; url: modelData.url
+                                text: modelData.sha + "  " + modelData.title + "  ·  " + modelData.age
+                            }
+                        }
+                        PlasmaComponents.Label {
+                            visible: repoBlock.open && (repoBlock.p.mrs?.length ?? 0) > 0
+                            Layout.leftMargin: Kirigami.Units.gridUnit * 2
+                            text: repoBlock.p.id.startsWith("gitlab:") ? "Open merge requests" : "Open pull requests"
+                            opacity: 0.6; font: Kirigami.Theme.smallFont
+                        }
+                        Repeater {
+                            model: repoBlock.open ? (repoBlock.p.mrs ?? []) : []
+                            SubRow {
+                                status: modelData.status; url: modelData.url
+                                text: modelData.ref + "  " + modelData.title + "  ·  " + modelData.branch
+                                    + (modelData.author ? "  ·  " + modelData.author : "") + "  ·  " + modelData.age
                             }
                         }
                     }

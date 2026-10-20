@@ -83,9 +83,17 @@ To set it by hand, add `namespace/service:port` after the kubeconfig path:
 
 ### CI pipelines
 
-In settings, search the repos your `gh` and `glab` logins can see and tick the ones to track. With an empty search the list shows only tracked repos. Each repo is tracked on its default branch.
+In settings, search the repos your `gh` and `glab` logins can see and tick the ones to track. With an empty search the list shows only tracked repos.
 
-Switch the widget to **Pipelines** at the top: one row per repo, click a row to open the run in your browser. The switch shows a badge with failed and running counts, e.g. `Pipelines 🔴 1 🔵 2`.
+| Setting | Default | |
+| --- | --- | --- |
+| Branches | the default branch | Comma-separated per repo, e.g. `main, develop`. Each branch gets its own row. |
+| Recent runs per repo | 5 | Last N commits on the branch with their status. 0 hides them. |
+| Merge / pull requests | on | Open MRs (GitLab) and PRs (GitHub) with their pipeline status. |
+
+Switch the widget to **Pipelines** at the top. Each repo row shows the latest run of its branch; click the row to expand its recent runs and open MRs/PRs, and click any run or MR/PR to open it in your browser. The switch shows a badge with failed and running counts, e.g. `Pipelines 🔴 1 🔵 2`.
+
+Notifications only cover tracked branches, not MR/PR pipelines, which fail often during review.
 
 | Dot | Status |
 | --- | --- |
@@ -222,7 +230,7 @@ kube-health --get                  # print all settings as JSON
 kube-health --list-repos           # repos your gh and glab logins can see
 ```
 
-Setting keys: the `NOTIFY_*` rules and thresholds from [Notifications](#notifications), plus `NOTIFY_DESKTOP`, `TG_TOKEN`, `TG_CHAT`, `SLACK_WEBHOOK`, `MATTERMOST_WEBHOOK`, `DISCORD_WEBHOOK`, `MUTE_UNTIL`.
+Setting keys: the `NOTIFY_*` rules and thresholds from [Notifications](#notifications), plus `PIPE_HISTORY`, `PIPE_MRS`, `NOTIFY_DESKTOP`, `TG_TOKEN`, `TG_CHAT`, `SLACK_WEBHOOK`, `MATTERMOST_WEBHOOK`, `DISCORD_WEBHOOK`, `MUTE_UNTIL`.
 
 ## How it works
 

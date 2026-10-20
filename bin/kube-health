@@ -17,6 +17,8 @@ HEALTH_MIN=${HEALTH_MIN:-$(cfg HEALTH_MIN)}
 [[ $HEALTH_MIN =~ ^[0-9]+$ ]] || HEALTH_MIN=95   # notify when pod health % drops below this
 NODE_CPU_MAX=$(cfg NODE_CPU_MAX); [[ $NODE_CPU_MAX =~ ^[0-9]+$ ]] || NODE_CPU_MAX=90   # notify when a node's CPU % reaches this
 NODE_MEM_MAX=$(cfg NODE_MEM_MAX); [[ $NODE_MEM_MAX =~ ^[0-9]+$ ]] || NODE_MEM_MAX=90   # notify when a node's RAM % reaches this
+PIPE_HISTORY=$(cfg PIPE_HISTORY); [[ $PIPE_HISTORY =~ ^[0-9]+$ ]] && [ "$PIPE_HISTORY" -le 20 ] || PIPE_HISTORY=5   # recent runs per repo
+PIPE_MRS=$(cfg PIPE_MRS)   # 0 hides open pull/merge requests
 
 send() { # $1 urgency, $2 title, $3 body; prints one result line per target
   local text="$2
@@ -39,7 +41,7 @@ $3" r tok chat
   hook discord "$(cfg DISCORD_WEBHOOK)" "$(jq -n --arg t "$text" '{content: $t[:1990]}')"
 }
 RULES="API WATCHDOG CRITICAL NODE_NOTREADY NODE_PRESSURE NODE_CPU NODE_MEM POD_HEALTH CRASHLOOP PIPELINES"
-KEYS="TG_TOKEN TG_CHAT SLACK_WEBHOOK MATTERMOST_WEBHOOK DISCORD_WEBHOOK HEALTH_MIN NODE_CPU_MAX NODE_MEM_MAX NOTIFY_DESKTOP MUTE_UNTIL $(printf 'NOTIFY_%s ' $RULES)"
+KEYS="TG_TOKEN TG_CHAT SLACK_WEBHOOK MATTERMOST_WEBHOOK DISCORD_WEBHOOK HEALTH_MIN NODE_CPU_MAX NODE_MEM_MAX PIPE_HISTORY PIPE_MRS NOTIFY_DESKTOP MUTE_UNTIL $(printf 'NOTIFY_%s ' $RULES)"
 set_cfg() { # KEY=VALUE lines on stdin; unknown keys are ignored
   local f="$CONF/settings.env" line k
   umask 077   # settings hold tokens; the temp file below must be private too
@@ -114,56 +116,87 @@ mkdir -p "$tmp/c" "$tmp/p"
 AGE='def age: (now - (sub("\\.[0-9]+"; "") | fromdateiso8601)) | floor
   | if . < 3600 then "\(./60|floor)m" elif . < 86400 then "\(./3600|floor)h" else "\(./86400|floor)d" end;'
 
-pipeline() { # $1 = repo spec (github:owner/repo@branch, gitlab:[host/]path@branch), $2 = output file
-  local spec=$1 out=$2 kind=${1%%:*} rest=${1#*:} repo branch host path enc
+# Pipeline statuses: passed, failed, running, pending, canceled, none (no pipelines), error (could not fetch).
+# Any failure wins, then running, then pending; all canceled is canceled; otherwise passed.
+COMBINE='def combine: . as $s
+  | if any($s[]; . == "failed") then "failed" elif any($s[]; . == "running") then "running"
+    elif any($s[]; . == "pending") then "pending" elif ($s | length) > 0 and all($s[]; . == "canceled") then "canceled"
+    elif ($s | length) == 0 then "none" else "passed" end;'
+
+pipeline() { # $1 = repo spec (github:owner/repo@branch, gitlab:[host/]path@branch), $2 = output file, $3 = 1 to include open PRs/MRs
+  local spec=$1 out=$2 with_mrs=$3 kind=${1%%:*} rest=${1#*:} repo branch host path enc
   repo=${rest%@*}; branch=${rest##*@}; [ "$branch" = "$rest" ] && branch=""
-  # status: passed, failed, running, pending, canceled, none (no pipelines), error (could not fetch).
   # last_finished drives notifications, so a running pipeline never counts as fixed.
+  # history: the last PIPE_HISTORY commits on the branch; mrs: open pull/merge requests with their pipeline status.
   case $kind in
     github)
-      timeout 20 gh run list -R "$repo" ${branch:+-b "$branch"} -L 30 \
+      # Busy repos run many workflows per commit, so fetch enough runs to cover PIPE_HISTORY commits.
+      timeout 20 gh run list -R "$repo" ${branch:+-b "$branch"} -L 100 \
         --json status,conclusion,headSha,displayTitle,url,createdAt > "$out.raw" 2>/dev/null || echo null > "$out.raw"
-      jq --arg id "$spec" --arg name "$repo" --arg b "$branch" "$AGE"'
+      if [ "$with_mrs" = 1 ]; then
+        timeout 20 gh pr list -R "$repo" --state open -L 20 \
+          --json number,title,headRefName,url,author,updatedAt,statusCheckRollup > "$out.mrs" 2>/dev/null || echo null > "$out.mrs"
+      else echo '[]' > "$out.mrs"; fi
+      jq -n --arg id "$spec" --arg name "$repo" --arg b "$branch" --argjson n "$PIPE_HISTORY" \
+        --slurpfile R "$out.raw" --slurpfile M "$out.mrs" "$AGE$COMBINE"'
         def norm: if .status != "completed" then (if .status | IN("queued","waiting","pending","requested") then "pending" else "running" end)
           elif .conclusion | IN("success","skipped","neutral") then "passed"
           elif .conclusion | IN("failure","timed_out","startup_failure") then "failed" else "canceled" end;
-        # All workflows of one commit combined: any failure wins, then running, then pending.
-        def combine: map(norm) as $s
-          | if any($s[]; . == "failed") then "failed" elif any($s[]; . == "running") then "running"
-            elif any($s[]; . == "pending") then "pending" elif all($s[]; . == "canceled") then "canceled" else "passed" end;
-        {id: $id, name: $name, branch: $b} + (
-          if . == null then {status: "error"}
-          elif length == 0 then {status: "none"}
-          else .[0].headSha as $sha | [.[] | select(.headSha == $sha)] as $cur
-            | ([.[] | select(.status == "completed")][0].headSha) as $fsha
-            | {status: ($cur | combine), sha: $sha[:7], title: $cur[0].displayTitle, url: $cur[0].url,
-               age: ($cur[0].createdAt | age),
-               last_finished: (if $fsha then [.[] | select(.headSha == $fsha and .status == "completed")] | combine else null end)}
-          end)' "$out.raw" > "$out" ;;
+        # PR checks are CheckRuns (status + conclusion) or StatusContexts (state).
+        def check: (.conclusion // .state // "") as $c | (.status // "") as $s
+          | if $c | IN("FAILURE","ERROR","TIMED_OUT","STARTUP_FAILURE","ACTION_REQUIRED") then "failed"
+            elif ($s | IN("IN_PROGRESS","QUEUED","PENDING","WAITING","REQUESTED")) or ($c | IN("PENDING","EXPECTED")) then "running"
+            elif $c | IN("SUCCESS","SKIPPED","NEUTRAL") then "passed" elif $c == "CANCELLED" then "canceled" else "pending" end;
+        # Runs grouped by commit, newest first.
+        def commits: reduce .[] as $r ([]; if (map(.sha) | index($r.headSha)) != null
+          then map(if .sha == $r.headSha then .runs += [$r] else . end) else . + [{sha: $r.headSha, runs: [$r]}] end);
+        $R[0] as $runs | $M[0] as $prs
+        | {id: $id, name: $name, branch: $b,
+           mrs: [$prs[]? | {ref: "#\(.number)", title, branch: .headRefName, author: (.author.login // ""), url,
+                            age: (.updatedAt | age), status: ([.statusCheckRollup[]? | check] | combine)}]} + (
+          if $runs == null then {status: "error", history: []}
+          elif ($runs | length) == 0 then {status: "none", history: []}
+          else ($runs | commits) as $cs
+            | ([$cs[] | select(any(.runs[]; .status == "completed"))][0]) as $fin
+            | ($cs[:([$n, 1] | max)] | map({status: ([.runs[] | norm] | combine), sha: .sha[:7], title: .runs[0].displayTitle,
+                                             url: .runs[0].url, age: (.runs[0].createdAt | age)})) as $h
+            | $h[0] + {history: (if $n > 0 then $h[:$n] else [] end),
+                       last_finished: (if $fin then [$fin.runs[] | select(.status == "completed") | norm] | combine else null end)}
+          end)' > "$out" ;;
     gitlab)
       path=$repo
       # A first segment with a dot is a self-hosted GitLab host: gitlab:gitlab.example.com/group/project
       [[ ${repo%%/*} == *.* ]] && host=${repo%%/*} && path=${repo#*/}
       enc=$(jq -rn --arg p "$path" '$p | @uri')
       g() { timeout 20 glab api ${host:+--hostname "$host"} "$@" 2>/dev/null; }
-      local q="ref=$(jq -rn --arg b "$branch" '$b | @uri')&per_page=1"
-      g "projects/$enc/pipelines?$q" > "$out.cur" || echo null > "$out.cur"
-      g "projects/$enc/pipelines?$q&scope=finished" > "$out.fin" || echo null > "$out.fin"
-      local sha; sha=$(jq -r '.[0].sha? // empty' "$out.cur")
-      { [ -n "$sha" ] && g "projects/$enc/repository/commits/$sha"; } > "$out.commit" || echo '{}' > "$out.commit"
-      jq -n --arg id "$spec" --arg name "$path" --arg b "$branch" \
-        --slurpfile C "$out.cur" --slurpfile F "$out.fin" --slurpfile M "$out.commit" "$AGE"'
-        def norm: if . == "success" then "passed" elif . == "failed" then "failed" elif . == "running" then "running"
-          elif . | IN("canceled","skipped") then "canceled" else "pending" end;
-        $C[0] as $c | $F[0] as $f | ($M[0] // {}) as $m
-        | {id: $id, name: $name, branch: $b} + (
-          if ($c | type) != "array" then {status: "error"}
-          elif ($c | length) == 0 then {status: "none"}
-          else {status: ($c[0].status | norm), sha: $c[0].sha[:7], title: ($m.title // ""), url: $c[0].web_url,
-                age: ($c[0].created_at | age), last_finished: ($f[0].status? | if . then norm else null end)}
+      local ref; ref=$(jq -rn --arg b "$branch" '$b | @uri')
+      g "projects/$enc/pipelines?ref=$ref&per_page=$(( PIPE_HISTORY > 1 ? PIPE_HISTORY : 1 ))" > "$out.cur" || echo null > "$out.cur"
+      g "projects/$enc/pipelines?ref=$ref&per_page=1&scope=finished" > "$out.fin" || echo null > "$out.fin"
+      g "projects/$enc/repository/commits?ref_name=$ref&per_page=50" > "$out.commits" || echo '[]' > "$out.commits"
+      if [ "$with_mrs" = 1 ]; then
+        g graphql -F p="$path" -f query='query($p: ID!) { project(fullPath: $p) { mergeRequests(state: opened, first: 20, sort: UPDATED_DESC) {
+          nodes { iid title webUrl sourceBranch updatedAt author { username } headPipeline { status path } } } } }' > "$out.mrs" \
+          || echo null > "$out.mrs"
+      else echo null > "$out.mrs"; fi
+      jq -n --arg id "$spec" --arg name "$path" --arg b "$branch" --argjson n "$PIPE_HISTORY" --arg web "https://${host:-gitlab.com}" \
+        --slurpfile C "$out.cur" --slurpfile F "$out.fin" --slurpfile T "$out.commits" --slurpfile M "$out.mrs" "$AGE$COMBINE"'
+        def norm: ascii_downcase | if . == "success" then "passed" elif . == "failed" then "failed" elif . == "running" then "running"
+          elif . | IN("canceled","canceling","skipped") then "canceled" else "pending" end;
+        $C[0] as $c | $F[0] as $f
+        | ([$T[0][]? | {key: .id[:7], value: .title}] | from_entries) as $titles
+        | ($c | if type == "array" then map({status: (.status | norm), sha: .sha[:7], title: ($titles[.sha[:7]] // ""),
+                                             url: .web_url, age: (.created_at | age)}) else null end) as $h
+        | {id: $id, name: $name, branch: $b,
+           mrs: [$M[0].data.project.mergeRequests.nodes[]? | {ref: "!\(.iid)", title, branch: .sourceBranch,
+                  author: (.author.username // ""), url: .webUrl, age: (.updatedAt | age),
+                  status: (if .headPipeline then .headPipeline.status | norm else "none" end)}]} + (
+          if $h == null then {status: "error", history: []}
+          elif ($h | length) == 0 then {status: "none", history: []}
+          else $h[0] + {history: (if $n > 0 then $h[:$n] else [] end),
+                        last_finished: ($f[0].status? | if . then norm else null end)}
           end)' > "$out" ;;
     *)
-      jq -n --arg id "$spec" '{id: $id, name: $id, branch: "", status: "error"}' > "$out" ;;
+      jq -n --arg id "$spec" '{id: $id, name: $id, branch: "", status: "error", history: [], mrs: []}' > "$out" ;;
   esac
 }
 
@@ -275,8 +308,13 @@ while read -r kc am; do
   [ -n "$kc" ] && [ "${kc:0:1}" != "#" ] && check "${kc/#\~/$HOME}" "$am" &
 done < "$CONF/clusters"
 i=0
+declare -A seen   # open PRs/MRs are per repo, so fetch them only for the first tracked branch
 while read -r spec; do
-  [ -n "$spec" ] && [ "${spec:0:1}" != "#" ] && { i=$((i + 1)); pipeline "$spec" "$tmp/p/$(printf %03d $i)" & }
+  [ -n "$spec" ] && [ "${spec:0:1}" != "#" ] || continue
+  i=$((i + 1)); mrs=0
+  [ "$PIPE_MRS" != 0 ] && [ -z "${seen[${spec%@*}]}" ] && mrs=1
+  seen[${spec%@*}]=1
+  pipeline "$spec" "$tmp/p/$(printf %03d $i)" "$mrs" &
 done < "$CONF/repos"
 wait
 

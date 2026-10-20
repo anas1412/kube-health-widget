@@ -12,6 +12,8 @@ PlasmoidItem {
     property int current: 0
     property string nsFilter: ""
     property int section: 0
+    property bool problemsOnly: false
+    property string sevFilter: ""
     property bool settingsOpen: false
     property string cfgClusters: ""
     property string cfgToken: ""
@@ -24,9 +26,11 @@ PlasmoidItem {
 
     function byNs(list) { return list.filter(x => !nsFilter || x.ns === nsFilter) }
     function bad(c) { return !c.up || c.watchdog === false }
+    function pct(c) { return c.pods.pct === null || c.pods.pct === undefined ? "?" : c.pods.pct + "%" }
     function color(c) {
         if (bad(c)) return Kirigami.Theme.negativeTextColor
-        if (c.pods.pct < 95 || c.alerts.some(a => a.severity === "critical")) return Kirigami.Theme.neutralTextColor
+        if ((c.pods.pct ?? 100) < 95 || c.alerts.some(a => a.severity === "critical")
+            || (c.nodes?.notready.length ?? 0) > 0) return Kirigami.Theme.neutralTextColor
         return Kirigami.Theme.positiveTextColor
     }
     function stateColor(s) {
@@ -39,7 +43,7 @@ PlasmoidItem {
     }
     // Worst cluster drives the panel icon.
     readonly property var worst: clusters.length ? clusters.slice().sort((a, b) =>
-        (bad(b) - bad(a)) || (a.pods.pct - b.pods.pct))[0] : null
+        (bad(b) - bad(a)) || ((a.pods.pct ?? 100) - (b.pods.pct ?? 100)))[0] : null
 
     P5Support.DataSource {
         id: exec
@@ -89,7 +93,7 @@ PlasmoidItem {
     Timer { id: refreshTimer; interval: 12000; onTriggered: root.load() }
 
     toolTipMainText: "Cluster Health"
-    toolTipSubText: clusters.map(c => `${c.name}: ${c.up ? c.pods.pct + "%" : "DOWN"}`).join("\n")
+    toolTipSubText: clusters.map(c => `${c.name}: ${c.up ? pct(c) : "DOWN"}`).join("\n")
 
     compactRepresentation: MouseArea {
         Layout.minimumWidth: row.implicitWidth
@@ -102,7 +106,7 @@ PlasmoidItem {
                 color: root.worst ? root.color(root.worst) : Kirigami.Theme.disabledTextColor
             }
             PlasmaComponents.Label {
-                text: !root.worst ? "?" : root.bad(root.worst) ? "DOWN" : root.worst.pods.pct + "%"
+                text: !root.worst ? "?" : root.bad(root.worst) ? "DOWN" : root.pct(root.worst)
             }
         }
     }
@@ -117,8 +121,10 @@ PlasmoidItem {
         Layout.preferredWidth: Kirigami.Units.gridUnit * 36
         Layout.preferredHeight: Kirigami.Units.gridUnit * 32
         readonly property var c: root.clusters[root.current] || null
-        readonly property var pods: c ? root.byNs(c.pods.recent) : []
-        readonly property var alerts: c ? root.byNs(c.alerts) : []
+        readonly property var pods: c ? root.byNs(c.pods.recent)
+            .filter(p => !root.problemsOnly || p.state === "bad" || p.state === "pending") : []
+        readonly property var alerts: c ? root.byNs(c.alerts)
+            .filter(a => !root.sevFilter || a.severity === root.sevFilter) : []
         readonly property var events: c ? root.byNs(c.events) : []
 
         RowLayout {
@@ -202,7 +208,9 @@ PlasmoidItem {
             Layout.fillWidth: true; wrapMode: Text.Wrap
             text: !c ? "" : (c.up ? "API ✅" : "API 🔴 unreachable")
                 + "   Watchdog " + (c.watchdog === null ? "n/a" : c.watchdog ? "✅" : "🔴 missing")
-                + "   Pods " + c.pods.healthy + "/" + c.pods.total + " (" + c.pods.pct + "%)"
+                + "   Pods " + c.pods.healthy + "/" + c.pods.total + " (" + root.pct(c) + ")"
+                + (c.nodes ? "   Nodes " + (c.nodes.total - c.nodes.notready.length) + "/" + c.nodes.total
+                    + (c.nodes.notready.length ? " 🟠 NotReady: " + c.nodes.notready.join(", ") : "") : "")
                 + "   · " + root.updated.replace("T", " ").replace("Z", " UTC")
             color: c ? root.color(c) : Kirigami.Theme.textColor
         }
@@ -220,6 +228,23 @@ PlasmoidItem {
                 Layout.preferredWidth: Kirigami.Units.gridUnit * 11
                 model: ["All namespaces"].concat(c ? c.pods.namespaces : [])
                 onActivated: root.nsFilter = currentIndex === 0 ? "" : currentText
+            }
+        }
+
+        RowLayout {
+            visible: !root.settingsOpen && root.section !== 2
+            PlasmaComponents.CheckBox {
+                visible: root.section === 0
+                text: "Problems only"
+                checked: root.problemsOnly
+                onToggled: root.problemsOnly = checked
+            }
+            PlasmaComponents.ComboBox {
+                visible: root.section === 1
+                readonly property var values: ["", "critical", "warning", "info"]
+                model: ["All severities", "Critical", "Warning", "Info"]
+                currentIndex: values.indexOf(root.sevFilter)
+                onActivated: root.sevFilter = values[currentIndex]
             }
         }
 

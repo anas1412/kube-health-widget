@@ -182,9 +182,11 @@ export default class KubeHealth extends Extension {
 
         menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem(`Updated ${this._status.updated}`));
         const refresh = new PopupMenu.PopupMenuItem('Refresh now');
+        // systemctl start returns when the check has finished (or joins the timer's run), then reload.
         refresh.connect('activate', () => {
-            GLib.spawn_command_line_async('systemctl --user start kube-health.service');
-            GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 12, () => { this._load(); return GLib.SOURCE_REMOVE; });
+            const proc = Gio.Subprocess.new(['systemctl', '--user', 'start', 'kube-health.service'], Gio.SubprocessFlags.NONE);
+            this._label.text = '⟳ …';
+            proc.wait_async(null, () => this._load());
         });
         menu.addMenuItem(refresh);
 

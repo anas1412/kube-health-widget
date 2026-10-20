@@ -84,16 +84,25 @@ PlasmoidItem {
                     root.mutedUntil = s.muted_until ?? 0
                     if (root.current >= root.clusters.length) root.current = 0
                 } catch (e) { root.clusters = [] }
+            } else if (source.includes("#refresh")) {
+                // systemctl start returns when the check has finished, so the results are ready now.
+                root.checking = false
+                root.load()
             } else if (source.includes("#mute")) {
                 root.load()
             }
         }
     }
     function load() { exec.connectSource(loadCmd) }
-    function refresh() { exec.connectSource("systemctl --user start kube-health.service; true #refresh"); refreshTimer.start() }
+    // Starts the shared check job; if the timer's run is already going, systemd waits for that one instead.
+    property bool checking: false
+    function refresh() {
+        if (checking) return
+        checking = true
+        exec.connectSource("systemctl --user start kube-health.service; true #refresh" + Date.now())
+    }
     function mute(arg) { exec.connectSource(bin + " --mute " + arg + " #mute" + Date.now()) }
     Timer { interval: 15000; running: true; repeat: true; triggeredOnStart: true; onTriggered: root.load() }
-    Timer { id: refreshTimer; interval: 12000; onTriggered: root.load() }
 
     Plasmoid.icon: "kube-health"
     toolTipMainText: "Kube Health"
@@ -205,9 +214,17 @@ PlasmoidItem {
                 text: root.showPipelines ? "Pipelines" : "Clusters"
             }
             PlasmaComponents.ToolButton {
+                visible: !root.checking
                 icon.name: "view-refresh"
                 PlasmaComponents.ToolTip { text: "Check now" }
                 onClicked: root.refresh()
+            }
+            PlasmaComponents.BusyIndicator {
+                visible: root.checking
+                running: root.checking
+                Layout.preferredWidth: Kirigami.Units.iconSizes.medium
+                Layout.preferredHeight: Kirigami.Units.iconSizes.medium
+                PlasmaComponents.ToolTip.text: "Checking…"
             }
             PlasmaComponents.ToolButton {
                 id: muteButton
@@ -300,7 +317,7 @@ PlasmoidItem {
                             }
                             PlasmaComponents.ToolButton {
                                 visible: !!repoBlock.p.url
-                                icon.name: "document-open-remote"
+                                icon.name: "internet-web-browser"
                                 PlasmaComponents.ToolTip { text: "Open latest run" }
                                 onClicked: Qt.openUrlExternally(repoBlock.p.url)
                             }

@@ -43,10 +43,20 @@ export default class KubeHealth extends Extension {
         Main.panel.addToStatusArea(this.uuid, this._button);
         this._load();
         this._timer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 15, () => { this._load(); return GLib.SOURCE_CONTINUE; });
+        // The extension runs the checks: every minute while it is enabled, so disabling or removing it stops them.
+        // --if-stale skips the run when the background timer checked under 50s ago.
+        const check = () => {
+            Gio.Subprocess.new([BIN, '--if-stale', '50'], Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE)
+                .wait_async(null, () => this._button && this._load());
+            return GLib.SOURCE_CONTINUE;
+        };
+        check();
+        this._checkTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 60, check);
     }
 
     disable() {
         GLib.source_remove(this._timer);
+        GLib.source_remove(this._checkTimer);
         this._button.destroy();
         this._button = this._label = this._status = null;
     }
@@ -182,11 +192,11 @@ export default class KubeHealth extends Extension {
 
         menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem(`Updated ${this._status.updated}`));
         const refresh = new PopupMenu.PopupMenuItem('Refresh now');
-        // systemctl start returns when the check has finished (or joins the timer's run), then reload.
+        // kube-health waits for a check that is already running, runs a fresh one, then returns.
         refresh.connect('activate', () => {
-            const proc = Gio.Subprocess.new(['systemctl', '--user', 'start', 'kube-health.service'], Gio.SubprocessFlags.NONE);
+            const proc = Gio.Subprocess.new([BIN], Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE);
             this._label.text = '⟳ …';
-            proc.wait_async(null, () => this._load());
+            proc.wait_async(null, () => this._button && this._load());
         });
         menu.addMenuItem(refresh);
 

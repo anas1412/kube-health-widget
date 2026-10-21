@@ -9,7 +9,7 @@
         "Website": "https://github.com/anas1412/kube-health-widget",
         "BugReportUrl": "https://github.com/anas1412/kube-health-widget/issues",
         "License": "MIT",
-        "Version": "1.2"
+        "Version": "1.3"
     },
     "KPackageStructure": "Plasma/Applet",
     "X-Plasma-API-Minimum-Version": "6.0"

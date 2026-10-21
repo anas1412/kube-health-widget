@@ -75,7 +75,7 @@ KCM.SimpleKCM {
         return rules.map(r => "NOTIFY_" + r.key + "=" + (ruleOn[r.key] !== false ? 1 : 0))
             .concat(Object.keys(limits).map(k => k + "=" + limits[k]))
             .concat(["PIPE_HISTORY=" + pipeHistory.value, "PIPE_MRS=" + (pipeMrs.checked ? 1 : 0)])
-            .concat(["NOTIFY_DESKTOP=" + (desktop.checked ? 1 : 0),
+            .concat(["NOTIFY_DESKTOP=" + (desktop.checked ? 1 : 0), "AUTO_UPDATE=" + (autoUpdate.checked ? 1 : 0),
                      "TG_TOKEN=" + tgToken.text.trim(), "TG_CHAT=" + tgChat.text.trim(),
                      "SLACK_WEBHOOK=" + slack.text.trim(), "MATTERMOST_WEBHOOK=" + mattermost.text.trim(),
                      "DISCORD_WEBHOOK=" + discord.text.trim()]).join("\n") + "\n"
@@ -86,7 +86,8 @@ KCM.SimpleKCM {
             + "; echo " + b64(selectedRepos.join("\n") + "\n") + " | base64 -d | " + bin + " --repos"
         if (mute.currentIndex > 0 || mutedUntil !== 0)
             cmd += "; " + bin + " --mute " + mutes[mute.currentIndex][1]
-        return cmd + "; systemctl --user start kube-health.service --no-block"
+        cmd += "; " + bin + " --background " + (background.checked ? "on" : "off")
+        return cmd + "; (" + bin + " >/dev/null 2>&1 &)"
     }
     function saveConfig() { exec.connectSource(saveCmd() + " #save" + Date.now()) }
 
@@ -107,6 +108,8 @@ KCM.SimpleKCM {
                     page.limits = {NODE_CPU_MAX: parseInt(v.NODE_CPU_MAX || "90"), NODE_MEM_MAX: parseInt(v.NODE_MEM_MAX || "90"),
                                    HEALTH_MIN: parseInt(v.HEALTH_MIN || "95")}
                     desktop.checked = v.NOTIFY_DESKTOP !== "0"
+                    background.checked = v.BACKGROUND === "1"
+                    autoUpdate.checked = v.AUTO_UPDATE !== "0"
                     pipeHistory.value = parseInt(v.PIPE_HISTORY || "5")
                     pipeMrs.checked = v.PIPE_MRS !== "0"
                     tgToken.text = v.TG_TOKEN || ""
@@ -261,6 +264,23 @@ KCM.SimpleKCM {
             id: desktop
             Kirigami.FormData.label: "Desktop:"
             text: "Show desktop notifications"
+            onToggled: page.changed()
+        }
+        QQC2.CheckBox {
+            id: background
+            Kirigami.FormData.label: "Background:"
+            text: "Keep checking when the widget is not on a panel"
+            onToggled: page.changed()
+        }
+        Hint {
+            text: "Off: checks and alerts run only while the widget is on a panel, and removing it stops everything. "
+                + "On: a systemd timer keeps checking and sending alerts (useful for Telegram or Slack) until you turn this off "
+                + "or uninstall."
+        }
+        QQC2.CheckBox {
+            id: autoUpdate
+            Kirigami.FormData.label: "Updates:"
+            text: "Update automatically once a day"
             onToggled: page.changed()
         }
         RowLayout {

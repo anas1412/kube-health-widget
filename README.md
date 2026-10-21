@@ -20,6 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/anas1412/kube-health-widget/main/in
 - **Mute**: for 1, 4, 8 or 24 hours, or until you unmute. You get a catch-up message when it ends.
 - **Settings UI**: everything is configurable from the widget, no file editing.
 - **Auto-update**: daily, from this repo.
+- **The widget is the app**: checks and alerts run while the widget is on a panel. Remove it and everything stops. Background checking for chat alerts is an opt-in setting.
 
 ## Requirements
 
@@ -39,15 +40,20 @@ No root needed. The installer:
 
 1. clones this repo to `~/.local/share/kube-health`
 2. installs the checker to `~/.local/bin/kube-health`
-3. starts two systemd user timers: checks every minute, updates daily
-4. installs the KDE widget and/or the GNOME extension, depending on what is installed
+3. installs the KDE widget and/or the GNOME extension, depending on what is installed
 
-Then put it in your panel:
+Nothing runs until you put the widget on your panel; from then on it checks every minute:
 
 | Desktop | Steps |
 | --- | --- |
 | KDE | Right-click the panel > **Add or Manage Widgets** > search **Kube Health** > drag it onto the panel |
 | GNOME | Log out and back in, then run `gnome-extensions enable kube-health@anas1412.github.io` |
+
+Removing the widget from the panel (or disabling the GNOME extension) stops all checks, alerts and updates. The files stay installed until you [uninstall](#uninstall).
+
+### Background checking (optional)
+
+Want alerts in Telegram or Slack even when the widget isn't on screen? Turn on **Keep checking when the widget is not on a panel** in settings. That starts a systemd user timer that runs the same check every minute until you turn it off or uninstall. With the widget on screen too, they share one check per minute.
 
 ## Settings
 
@@ -204,11 +210,10 @@ Each node shows its pool, pods running / pod capacity, and CPU and RAM bars with
 
 ## Updates
 
-Automatic. Once a day the update timer pulls `main`, reinstalls if anything changed, and shows a desktop notification. Checker changes apply on the next check; widget changes load after you log out and back in.
+Automatic while checks are running: once a day the checker pulls `main`, reinstalls if anything changed, and shows a desktop notification. Checker changes apply on the next check; widget changes load after you log out and back in. Turn it off with **Update automatically once a day** in settings.
 
 ```bash
-~/.local/share/kube-health/install.sh --update              # update now
-systemctl --user disable --now kube-health-update.timer     # turn off auto-update
+~/.local/share/kube-health/install.sh --update     # update now
 ```
 
 ## Uninstall
@@ -224,27 +229,27 @@ Removes the checker, timers, widget, extension and icon. Settings in `~/.config/
 ```bash
 kube-health                        # run a check now
 kube-health --test                 # send a test message to every configured target
+kube-health --background on        # keep checking without the widget (off to stop)
 kube-health --mute 3600            # mute for 1 hour (seconds), or: --mute forever, --mute off
 kube-health --set HEALTH_MIN=90    # change a setting
 kube-health --get                  # print all settings as JSON
 kube-health --list-repos           # repos your gh and glab logins can see
 ```
 
-Setting keys: the `NOTIFY_*` rules and thresholds from [Notifications](#notifications), plus `PIPE_HISTORY`, `PIPE_MRS`, `NOTIFY_DESKTOP`, `TG_TOKEN`, `TG_CHAT`, `SLACK_WEBHOOK`, `MATTERMOST_WEBHOOK`, `DISCORD_WEBHOOK`, `MUTE_UNTIL`.
+Setting keys: the `NOTIFY_*` rules and thresholds from [Notifications](#notifications), plus `PIPE_HISTORY`, `PIPE_MRS`, `BACKGROUND`, `AUTO_UPDATE`, `NOTIFY_DESKTOP`, `TG_TOKEN`, `TG_CHAT`, `SLACK_WEBHOOK`, `MATTERMOST_WEBHOOK`, `DISCORD_WEBHOOK`, `MUTE_UNTIL`.
 
 ## How it works
 
 ```
-kube-health.timer (every 60s)
-  └─ kube-health ──kubectl──> each cluster
-       ├─ ~/.cache/kube-health/status.json ──> KDE widget / GNOME extension (read only)
-       └─ on change, unless muted: desktop, Telegram, Slack, Mattermost, Discord
-
-kube-health-update.timer (daily)
-  └─ install.sh --update: git pull, reinstall if changed
+KDE widget / GNOME extension, every 60s while on screen
+(or kube-health.timer, only with background checking on)
+  └─ kube-health --if-stale 50 ──kubectl, gh, glab──> clusters and repos
+       ├─ ~/.cache/kube-health/status.json ──> widget reads it every 15s
+       ├─ on change, unless muted: desktop, Telegram, Slack, Mattermost, Discord
+       └─ once a day: install.sh --update (git pull, reinstall if changed)
 ```
 
-The checker is plain bash and works on any desktop. The panel UIs read `status.json` and change settings only through the `kube-health` command, so they never call the cluster themselves.
+The checker is plain bash and works on any desktop. One check runs at a time (a lock file), and `--if-stale 50` skips a run if another one finished under 50 seconds ago, so two widgets, or a widget plus the background timer, still mean one check per minute. **Check now** waits for a running check and then runs a fresh one.
 
 | Path | Content |
 | --- | --- |
@@ -259,8 +264,8 @@ The checker is plain bash and works on any desktop. The panel UIs read `status.j
 
 ```bash
 jq '.clusters[] | {name, up, watchdog, alertmanager, pct: .pods.pct}' ~/.cache/kube-health/status.json
-systemctl --user list-timers 'kube-health*'
-journalctl --user -u kube-health.service -u kube-health-update.service
+systemctl --user list-timers 'kube-health*'          # only with background checking on
+journalctl --user -u kube-health.service
 ```
 
 | Symptom | Fix |
@@ -269,6 +274,7 @@ journalctl --user -u kube-health.service -u kube-health-update.service
 | Widget not in the Add Widgets list (KDE) | Run `systemctl --user restart plasma-plasmashell` |
 | A target gets no messages | Use **Save and send test message**; it shows the error for each target. |
 | Watchdog `n/a` | No Alertmanager found. Set it by hand in the clusters list. |
+| Alerts keep coming after removing the widget | Background checking is on. Turn it off in settings, or run `kube-health --background off`. |
 
 ## License
 

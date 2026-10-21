@@ -153,13 +153,19 @@ export default class KubeHealthPrefs extends ExtensionPreferences {
             description: 'Messages are sent from this computer, so they stop while it is off or asleep.',
         });
         const desktop = new Adw.SwitchRow({title: 'Desktop notifications', active: true});
+        const background = new Adw.SwitchRow({
+            title: 'Keep checking when the extension is off',
+            subtitle: 'Off: checks and alerts stop when you disable or remove the extension. On: a systemd timer keeps ' +
+                'checking and alerting (useful for Telegram or Slack).',
+        });
+        const autoUpdate = new Adw.SwitchRow({title: 'Update automatically once a day', active: true});
         const mute = new Adw.ComboRow({title: 'Mute', model: Gtk.StringList.new(MUTES.map(m => m[0]))});
         const tgToken = new Adw.PasswordEntryRow({title: 'Telegram bot token (from @BotFather)'});
         const tgChat = new Adw.EntryRow({title: 'Telegram chat id'});
         const slack = new Adw.PasswordEntryRow({title: 'Slack webhook URL'});
         const mattermost = new Adw.PasswordEntryRow({title: 'Mattermost webhook URL'});
         const discord = new Adw.PasswordEntryRow({title: 'Discord webhook URL'});
-        for (const w of [desktop, mute, tgToken, tgChat, slack, mattermost, discord])
+        for (const w of [desktop, background, autoUpdate, mute, tgToken, tgChat, slack, mattermost, discord])
             deliveryGroup.add(w);
         page.add(deliveryGroup);
 
@@ -167,7 +173,7 @@ export default class KubeHealthPrefs extends ExtensionPreferences {
             const lines = RULES.map(r => `NOTIFY_${r.key}=${ruleRows[r.key].active ? 1 : 0}`)
                 .concat(Object.entries(limitSpins).map(([k, s]) => `${k}=${s.get_value_as_int()}`))
                 .concat([`PIPE_HISTORY=${history.value}`, `PIPE_MRS=${mrs.active ? 1 : 0}`])
-                .concat([`NOTIFY_DESKTOP=${desktop.active ? 1 : 0}`,
+                .concat([`NOTIFY_DESKTOP=${desktop.active ? 1 : 0}`, `AUTO_UPDATE=${autoUpdate.active ? 1 : 0}`,
                     `TG_TOKEN=${tgToken.text.trim()}`, `TG_CHAT=${tgChat.text.trim()}`,
                     `SLACK_WEBHOOK=${slack.text.trim()}`, `MATTERMOST_WEBHOOK=${mattermost.text.trim()}`,
                     `DISCORD_WEBHOOK=${discord.text.trim()}`]);
@@ -176,7 +182,8 @@ export default class KubeHealthPrefs extends ExtensionPreferences {
             await run(['--repos'], `${[...tracked].flatMap(([b, brs]) => brs.map(br => `${b}@${br}`)).join('\n')}\n`);
             if (mute.selected > 0 || mutedUntil !== 0)
                 await run(['--mute', MUTES[mute.selected][1]]);
-            GLib.spawn_command_line_async('systemctl --user start kube-health.service --no-block');
+            await run(['--background', background.active ? 'on' : 'off']);
+            Gio.Subprocess.new([BIN], Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE);
         };
 
         // ---- Actions ----
@@ -207,6 +214,8 @@ export default class KubeHealthPrefs extends ExtensionPreferences {
             for (const r of RULES.filter(x => x.limit))
                 limitSpins[r.limit].value = parseInt(v[r.limit] || `${r.def}`);
             desktop.active = v.NOTIFY_DESKTOP !== '0';
+            background.active = v.BACKGROUND === '1';
+            autoUpdate.active = v.AUTO_UPDATE !== '0';
             history.value = parseInt(v.PIPE_HISTORY || '5');
             mrs.active = v.PIPE_MRS !== '0';
             tgToken.text = v.TG_TOKEN || '';

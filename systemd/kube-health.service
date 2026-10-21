@@ -1,6 +1,6 @@
 [Unit]
-Description=Check Kubernetes cluster health
+Description=Check Kubernetes cluster health (background mode, used when no widget is on screen)
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/bin/kube-health
+ExecStart=%h/.local/bin/kube-health --if-stale 50

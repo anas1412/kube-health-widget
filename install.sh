@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install:    curl -fsSL https://raw.githubusercontent.com/anas1412/kube-health-widget/main/install.sh | bash
-# Update:     ~/.local/share/kube-health/install.sh --update   (run daily by kube-health-update.timer)
+# Update:     ~/.local/share/kube-health/install.sh --update   (run daily by the checker while the widget is on screen)
 # Uninstall:  ~/.local/share/kube-health/install.sh --uninstall
 set -e
 REPO=${KUBE_HEALTH_REPO:-https://github.com/anas1412/kube-health-widget.git}
@@ -79,8 +79,16 @@ fi
 # Runs after the new widget is installed, so panel instances can be swapped onto it.
 migrate_from_cluster_health
 
+# The widget runs the checks itself. Before 1.3 two timers ran them (and updates) even with no widget.
+systemctl --user disable --now kube-health-update.timer >/dev/null 2>&1 || true
+rm -f "$UNITS"/kube-health-update.{service,timer}
 systemctl --user daemon-reload
-systemctl --user enable --now kube-health.timer kube-health-update.timer >/dev/null 2>&1
+# The check timer is only for "keep checking in the background" (BACKGROUND=1 in settings).
+if grep -qx 'BACKGROUND=1' "$HOME/.config/kube-health/settings.env" 2>/dev/null; then
+  systemctl --user enable --now kube-health.timer >/dev/null 2>&1
+else
+  systemctl --user disable --now kube-health.timer >/dev/null 2>&1 || true
+fi
 command -v gnome-shell >/dev/null && { gnome-extensions enable "$GNOME_UUID" 2>/dev/null || true; }
 
 version=$(git log -1 --format='%h %s')
@@ -93,4 +101,4 @@ fi
 echo "Installed $version"
 command -v plasmashell >/dev/null && echo "KDE: right-click the panel > Add or Manage Widgets > Kube Health"
 command -v gnome-shell >/dev/null && echo "GNOME: log out and back in if the icon is missing, then: gnome-extensions enable $GNOME_UUID"
-echo "Settings: open the widget and click the gear icon. Auto-update: daily."
+echo "Checks run while the widget is on screen; remove the widget and they stop. Settings: the gear icon in the widget."

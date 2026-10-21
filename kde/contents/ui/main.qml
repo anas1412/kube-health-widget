@@ -85,21 +85,27 @@ PlasmoidItem {
                     if (root.current >= root.clusters.length) root.current = 0
                 } catch (e) { root.clusters = [] }
             } else if (source.includes("#refresh")) {
-                // systemctl start returns when the check has finished, so the results are ready now.
+                // kube-health returns when the check has finished, so the results are ready now.
                 root.checking = false
                 root.load()
-            } else if (source.includes("#mute")) {
+            } else if (source.includes("#check") || source.includes("#mute")) {
                 root.load()
             }
         }
     }
     function load() { exec.connectSource(loadCmd) }
-    // Starts the shared check job; if the timer's run is already going, systemd waits for that one instead.
+    // The widget runs the checks: every minute while it is on a panel, so removing it stops them.
+    // --if-stale skips the run when another widget (or the background timer) checked under 50s ago.
+    Timer {
+        interval: 60000; running: true; repeat: true; triggeredOnStart: true
+        onTriggered: exec.connectSource(root.bin + " --if-stale 50 >/dev/null 2>&1; true #check" + Date.now())
+    }
+    // Check now: waits for a check that is already running, then runs a fresh one.
     property bool checking: false
     function refresh() {
         if (checking) return
         checking = true
-        exec.connectSource("systemctl --user start kube-health.service; true #refresh" + Date.now())
+        exec.connectSource(bin + " >/dev/null 2>&1; true #refresh" + Date.now())
     }
     function mute(arg) { exec.connectSource(bin + " --mute " + arg + " #mute" + Date.now()) }
     Timer { interval: 15000; running: true; repeat: true; triggeredOnStart: true; onTriggered: root.load() }

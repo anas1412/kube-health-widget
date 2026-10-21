@@ -2,10 +2,14 @@
 # Checks every cluster in ~/.config/kube-health/clusters and the CI pipeline of every repo in
 # ~/.config/kube-health/repos, writes ~/.cache/kube-health/status.json and notifies
 # (desktop, Telegram, Slack, Mattermost, Discord) on changes.
-#   kube-health          run one check
-#   kube-health --test   send a test message to every configured target
+#   kube-health                 run one check (waits for a check that is already running)
+#   kube-health --if-stale 50   run one check unless one ran in the last 50s or is running now
+#   kube-health --test          send a test message to every configured target
+# The KDE widget and GNOME extension run it every minute while they are on screen; the systemd
+# timer only runs it when "keep checking in the background" is on (kube-health --background on).
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/kube-health"
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/kube-health"
+SRC="$HOME/.local/share/kube-health"
 mkdir -p "$CONF" "$CACHE"
 [ -f "$CONF/clusters" ] || echo "${KUBECONFIG:-$HOME/.kube/config}" > "$CONF/clusters"
 [ -f "$CONF/repos" ] || touch "$CONF/repos"
@@ -41,7 +45,7 @@ $3" r tok chat
   hook discord "$(cfg DISCORD_WEBHOOK)" "$(jq -n --arg t "$text" '{content: $t[:1990]}')"
 }
 RULES="API WATCHDOG CRITICAL NODE_NOTREADY NODE_PRESSURE NODE_CPU NODE_MEM POD_HEALTH CRASHLOOP PIPELINES"
-KEYS="TG_TOKEN TG_CHAT SLACK_WEBHOOK MATTERMOST_WEBHOOK DISCORD_WEBHOOK HEALTH_MIN NODE_CPU_MAX NODE_MEM_MAX PIPE_HISTORY PIPE_MRS NOTIFY_DESKTOP MUTE_UNTIL $(printf 'NOTIFY_%s ' $RULES)"
+KEYS="TG_TOKEN TG_CHAT SLACK_WEBHOOK MATTERMOST_WEBHOOK DISCORD_WEBHOOK HEALTH_MIN NODE_CPU_MAX NODE_MEM_MAX PIPE_HISTORY PIPE_MRS NOTIFY_DESKTOP MUTE_UNTIL BACKGROUND AUTO_UPDATE $(printf 'NOTIFY_%s ' $RULES)"
 set_cfg() { # KEY=VALUE lines on stdin; unknown keys are ignored
   local f="$CONF/settings.env" line k
   umask 077   # settings hold tokens; the temp file below must be private too
@@ -108,7 +112,24 @@ case "$1" in
     [ -f "$CACHE/status.json" ] && jq --argjson m "$(muted_until)" '.muted_until = $m' "$CACHE/status.json" > "$CACHE/status.json.tmp" \
       && mv "$CACHE/status.json.tmp" "$CACHE/status.json"
     exit 0 ;;
+  --background) # --background <on|off>: keep checking with a systemd timer when no widget is on screen
+    case "$2" in
+      on) echo "BACKGROUND=1" | set_cfg; systemctl --user enable --now kube-health.timer >/dev/null 2>&1 ;;
+      off) echo "BACKGROUND=0" | set_cfg; systemctl --user disable --now kube-health.timer >/dev/null 2>&1 ;;
+      *) echo "usage: kube-health --background <on|off>" >&2; exit 1 ;;
+    esac
+    exit 0 ;;
 esac
+
+# One check at a time. The widget's minute timer uses --if-stale, so several widgets (or the widget
+# plus the background timer) result in one check per minute; "Check now" waits and runs a fresh one.
+exec 9>"$CACHE/lock"
+if [ "$1" = --if-stale ]; then
+  flock -n 9 || exit 0
+  [ -f "$CACHE/status.json" ] && [ $(( $(date +%s) - $(stat -c %Y "$CACHE/status.json") )) -lt "${2:-50}" ] && exit 0
+else
+  flock 9
+fi
 
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/c" "$tmp/p"
@@ -323,6 +344,12 @@ jq -n --argjson m "$(muted_until)" --argjson cpu "$NODE_CPU_MAX" --argjson mem "
   '{updated: (now | todate), muted_until: $m, thresholds: {node_cpu: $cpu, node_mem: $mem, health: $health},
     clusters: $c, pipelines: $p}' > "$tmp/status"
 cp "$tmp/status" "$CACHE/status.json.tmp" && mv "$CACHE/status.json.tmp" "$CACHE/status.json"
+
+# Daily self-update, only while checks run, so removing the widget also stops updates.
+if [ "$(cfg AUTO_UPDATE)" != 0 ] && [ -x "$SRC/install.sh" ] && [ -z "$(find "$CACHE/last-update" -mmin -1440 2>/dev/null)" ]; then
+  touch "$CACHE/last-update"
+  setsid "$SRC/install.sh" --update </dev/null >/dev/null 2>&1 9>&- &
+fi
 
 # Problems worth a notification. Lines must be stable between runs (no changing numbers), since
 # notifications fire on lines that appear or disappear. Warnings stay in the UI only.
